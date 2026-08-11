@@ -36,13 +36,7 @@ It is intended as a diagnostic and development tool for investigating probe drif
 
 ## Screenshot
 
-Add a screenshot of the dashboard here after uploading one to your repository.
-
-Example:
-
-```markdown
 ![Eddy Live Dashboard](images/dashboard.png)
-```
 
 ## How it works
 
@@ -671,26 +665,6 @@ The dashboard is intended for diagnostics rather than replacing Klipper's intern
 - Closing or restarting the application clears the graph history.
 - CSV recording is not currently included.
 
-## Possible future features
-
-Potential additions include:
-
-- Start/stop CSV recording
-- Download recorded data from the browser
-- Automatic Eddy probe detection
-- Automatic temperature probe detection
-- Read calibration directly from Klipper
-- Multiple probe support
-- Configurable graph colors
-- Adjustable sample averaging
-- Frequency drift rate in Hz/min and ppm/min
-- Min/max statistics
-- Standard deviation
-- Automatic test timer
-- Comparison of multiple recorded runs
-- MQTT output
-- Home Assistant integration
-
 ## Updating
 
 Replace:
@@ -742,8 +716,3 @@ Always verify probe behavior using the normal Klipper calibration and printer se
 
 Do not use the dashboard's calibration-equivalent Z value as a replacement for Klipper's normal probing, homing, Z-offset, or safety logic.
 
-## License
-
-No license is included automatically.
-
-If you want this project to be open source, add a license file to the repository. MIT is a common choice for small utility projects, but choose whichever license matches how you want others to use and redistribute the code.
