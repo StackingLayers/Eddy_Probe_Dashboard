@@ -584,6 +584,24 @@ button:hover {
     display: none;
 }
 
+.settings-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 14px;
+}
+
+.settings-title {
+    margin: 0;
+    font-size: 18px;
+}
+
+.settings-close {
+    flex: 0 0 auto;
+    padding: 6px 10px;
+}
+
 .settings-grid {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
@@ -731,6 +749,11 @@ Window:
 </div>
 
 <div id="settingsPanel" class="settings-panel" hidden>
+
+<div class="settings-header">
+<h2 class="settings-title">Settings</h2>
+<button id="closeSettings" class="settings-close" type="button">Close</button>
+</div>
 
 <div class="settings-grid">
 
@@ -1370,6 +1393,28 @@ document.getElementById(
 
         if (!settingsPanel.hidden) {
             await loadConfigForm();
+        }
+    }
+);
+
+
+document.getElementById(
+    "closeSettings"
+).addEventListener(
+    "click",
+    () => {
+        settingsPanel.hidden = true;
+    }
+);
+
+document.addEventListener(
+    "keydown",
+    event => {
+        if (
+            event.key === "Escape"
+            && !settingsPanel.hidden
+        ) {
+            settingsPanel.hidden = true;
         }
     }
 );
