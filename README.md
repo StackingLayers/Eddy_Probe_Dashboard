@@ -84,12 +84,7 @@ Selectable history windows:
 ---
 
 ## Screenshot
-
-Add a screenshot of the dashboard to your repository, for example:
-
-```markdown
 ![Eddy / Cartographer Live Dashboard](images/dashboard.png)
-```
 
 ---
 
