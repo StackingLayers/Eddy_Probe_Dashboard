@@ -1,60 +1,150 @@
-# Eddy Live Dashboard
+# Eddy / Cartographer Live Dashboard
 
-A lightweight, read-only live dashboard for Klipper eddy-current probes using the LDC1612 sensor interface.
+A lightweight, read-only live dashboard for Klipper eddy-current probes.
 
-The dashboard connects to Klipper through Moonraker, reads the live LDC1612 frequency stream, reads the probe temperature, and optionally converts the measured frequency into a calibration-equivalent Z position using the probe's existing Klipper calibration data.
+The dashboard supports:
 
-It is intended as a diagnostic and development tool for investigating probe drift, thermal behavior, repeatability, sensor stability, and other eddy-current probe behavior.
+- BTT Eddy and other Klipper probes using the LDC1612 interface
+- Cartographer V3 using the current Cartographer3D plugin
+
+It provides live scrolling graphs for probe frequency, temperature, and Z/distance, along with baseline drift measurements and configurable probe settings.
+
+The project is intended as a diagnostic and development tool for investigating:
+
+- probe drift
+- thermal behavior
+- frequency stability
+- repeatability
+- sensor warm-up
+- apparent Z movement
+- Cartographer scan-model behavior
+- effects of probe height or target interaction
+- changes caused by different LDC drive-current settings
+
+---
 
 ## Features
 
+### Live data
+
 - Live scrolling frequency graph
 - Live probe temperature graph
-- Live calibration-equivalent Z graph
+- Live Z/distance graph
 - Current frequency display
 - Current probe temperature display
-- Current calibration-equivalent Z display
+- Current Z/distance display
 - Frequency drift in ppm
 - Frequency change from baseline
 - Temperature change from baseline
 - Z change from baseline in microns
 - Resettable baseline
-- Selectable graph windows:
-  - 1 minute
-  - 5 minutes
-  - 20 minutes
-  - 1 hour
+
+### Graph windows
+
+Selectable history windows:
+
+- 1 minute
+- 5 minutes
+- 20 minutes
+- 1 hour
+
+### Probe support
+
+#### BTT Eddy / Klipper LDC1612
+
+- Uses Klipper's `ldc1612/dump_ldc1612` stream
 - User-configurable Eddy sensor name
-- User-configurable temperature probe name
+- Optional temperature probe name
+- Paste-in Klipper `calibrate =` table
+- Calculates calibration-equivalent Z by interpolation
+
+#### Cartographer V3 / Cartographer3D Plugin
+
+- Uses the Klipper `cartographer` status object
+- Reads live:
+  - frequency
+  - temperature
+  - sample time
+  - raw sensor sample data
+- Starts a Cartographer stream session automatically
+- Uses the Cartographer scan model for frequency-to-distance conversion
+- Accepts the `[cartographer scan_model default]` block directly
+- Automatically stops/recycles its Cartographer stream session to avoid unbounded sample accumulation
+
+### General
+
 - User-configurable Moonraker host and port
-- Paste-in Klipper calibration data
-- Calibration data is saved between restarts
-- Automatically reconnects to Klipper if the connection is interrupted
-- Read-only operation
-- No Klipper source modifications required
-- No printer configuration changes required
+- Settings saved between restarts
+- Automatically reconnects after interruptions
+- Read-only with respect to normal printer operation
+- No Klipper source modification required
+- No firmware modification required
+- No permanent printer configuration changes required
+
+---
 
 ## Screenshot
 
-![Eddy Live Dashboard](images/dashboard.png)
+Add a screenshot of the dashboard to your repository, for example:
 
-## How it works
+```markdown
+![Eddy / Cartographer Live Dashboard](images/dashboard.png)
+```
 
-The application uses Moonraker's Klipper socket interface to subscribe to the LDC1612 diagnostic stream:
+---
+
+# How it works
+
+The dashboard runs as a small Flask web application on the Klipper host.
+
+A typical data path looks like:
+
+```text
+Probe
+  │
+  ▼
+Klipper
+  │
+  ▼
+Moonraker
+  │
+  ▼
+eddy_dashboard.py
+  │
+  ├── live frequency
+  ├── probe temperature
+  ├── calculated Z / Cartographer distance
+  └── baseline drift statistics
+  │
+  ▼
+Web browser
+```
+
+The dashboard itself does not command printer motion, heaters, probing, homing, or calibration.
+
+---
+
+# BTT Eddy mode
+
+For BTT Eddy-style probes, the application connects to Klipper through Moonraker's Klipper socket and subscribes to:
 
 ```text
 ldc1612/dump_ldc1612
 ```
 
-Klipper provides raw sensor data containing:
+Klipper returns LDC1612 sensor samples containing:
 
 ```text
-time, frequency, z
+time
+frequency
+z
 ```
 
-The dashboard averages each incoming batch before plotting it. This reduces the amount of browser data while still producing a smooth live graph.
+The dashboard averages each incoming Klipper batch before plotting it.
 
-Probe temperature is read separately from Moonraker using the configured:
+This reduces browser load while still providing a smooth live graph.
+
+Temperature is read separately from the configured Klipper:
 
 ```ini
 [temperature_probe ...]
@@ -62,21 +152,105 @@ Probe temperature is read separately from Moonraker using the configured:
 
 object.
 
-The dashboard itself does not write to Klipper and does not modify probe calibration, Z offset, configuration files, firmware, or printer state.
+---
 
-## Requirements
+# Cartographer V3 mode
+
+The current Cartographer3D plugin is handled differently from BTT Eddy.
+
+The dashboard reads the Klipper object:
+
+```text
+cartographer
+```
+
+and uses:
+
+```text
+cartographer.mcu.last_sample
+```
+
+The live Cartographer sample contains values such as:
+
+```text
+frequency
+time
+position
+temperature
+raw_count
+```
+
+Example Klipper/Moonraker object structure:
+
+```text
+cartographer
+└── mcu
+    └── last_sample
+        ├── frequency
+        ├── time
+        ├── position
+        ├── temperature
+        └── raw_count
+```
+
+## Why the dashboard starts a Cartographer stream
+
+The current Cartographer3D plugin does not continuously update `last_sample` while the sensor is idle.
+
+To obtain continuously updating live data, the dashboard starts:
+
+```text
+CARTOGRAPHER_STREAM ACTION=START
+```
+
+through Moonraker.
+
+When the dashboard stops or changes modes, it cancels the stream with:
+
+```text
+CARTOGRAPHER_STREAM ACTION=CANCEL
+```
+
+The dashboard also periodically recycles the stream session.
+
+This is intentional because Cartographer's diagnostic streaming session stores samples during the active session. Recycling the session prevents an indefinitely running dashboard from allowing that sample list to grow without limit.
+
+---
+
+# Requirements
 
 A Klipper installation with:
 
+- Klipper
 - Moonraker
-- An eddy-current probe using Klipper's `probe_eddy_current`
-- LDC1612 diagnostic stream support
 - Python 3
-- Network access to the printer
+- network access to the printer
 
-The application was developed around a BTT Eddy-style LDC1612 probe, but the sensor name is configurable and it may work with other Klipper probes using the same LDC1612 interface.
+And one of:
 
-### Python packages
+### BTT Eddy / LDC1612
+
+A probe using Klipper's:
+
+```ini
+[probe_eddy_current ...]
+```
+
+implementation with the LDC1612 diagnostic stream available.
+
+### Cartographer V3
+
+A Cartographer V3 running the current Cartographer3D plugin and exposing:
+
+```text
+cartographer
+```
+
+in Klipper's object list.
+
+---
+
+# Python packages
 
 The dashboard requires:
 
@@ -85,24 +259,26 @@ Flask
 websocket-client
 ```
 
-## Installation
+---
+
+# Installation
 
 SSH into the Klipper host.
 
-Create a directory for the dashboard:
+Create a directory:
 
 ```bash
 mkdir -p ~/eddy-dashboard
 cd ~/eddy-dashboard
 ```
 
-Create a Python virtual environment:
+Create a virtual environment:
 
 ```bash
 python3 -m venv venv
 ```
 
-If the `venv` module is not installed:
+If the `venv` module is missing:
 
 ```bash
 sudo apt update
@@ -115,7 +291,7 @@ Activate the environment:
 source venv/bin/activate
 ```
 
-Install the required packages:
+Install dependencies:
 
 ```bash
 pip install Flask websocket-client
@@ -127,7 +303,7 @@ Copy the dashboard script into the directory and name it:
 eddy_dashboard.py
 ```
 
-The resulting directory should look similar to:
+The directory should look similar to:
 
 ```text
 ~/eddy-dashboard/
@@ -135,16 +311,18 @@ The resulting directory should look similar to:
 └── venv/
 ```
 
-## Running manually
+---
 
-Activate the virtual environment:
+# Running manually
+
+Activate the environment:
 
 ```bash
 cd ~/eddy-dashboard
 source venv/bin/activate
 ```
 
-Start the dashboard:
+Run:
 
 ```bash
 python3 eddy_dashboard.py
@@ -155,12 +333,11 @@ You should see output similar to:
 ```text
 Eddy dashboard starting on port 8085
 
-Connected to Klipper LDC stream
  * Running on http://127.0.0.1:8085
  * Running on http://<printer-ip>:8085
 ```
 
-Open a browser and go to:
+Open:
 
 ```text
 http://PRINTER_IP:8085
@@ -172,27 +349,52 @@ For example:
 http://192.168.1.100:8085
 ```
 
-If your local hostname resolves correctly, you may also be able to use:
+If the printer hostname resolves locally, something like this may also work:
 
 ```text
 http://voron:8085
 ```
 
-## First-time setup
+---
 
-Open the dashboard and click **Settings**.
+# First-time setup
 
-Configure the following fields.
+Open the dashboard and select **Settings**.
 
-### Moonraker host
+The Settings window can be closed using:
 
-If the dashboard runs on the same machine as Moonraker, use:
+- the **Close** button
+- the `Esc` key
+
+---
+
+# Probe type
+
+Select the appropriate probe:
+
+```text
+BTT Eddy / Klipper LDC1612
+```
+
+or:
+
+```text
+Cartographer V3 / Scanner plugin
+```
+
+---
+
+# Moonraker settings
+
+## Moonraker host
+
+If the dashboard runs on the same computer as Moonraker, use:
 
 ```text
 127.0.0.1
 ```
 
-### Moonraker port
+## Moonraker port
 
 The normal Moonraker port is:
 
@@ -200,9 +402,19 @@ The normal Moonraker port is:
 7125
 ```
 
-### Eddy sensor name
+---
 
-Enter the name used after `probe_eddy_current` in your Klipper configuration.
+# BTT Eddy configuration
+
+When **BTT Eddy / Klipper LDC1612** is selected, configure the following.
+
+## Eddy sensor name
+
+Use the name after:
+
+```ini
+[probe_eddy_current ...]
+```
 
 For example:
 
@@ -210,15 +422,19 @@ For example:
 [probe_eddy_current btt_eddy]
 ```
 
-would use:
+uses:
 
 ```text
 btt_eddy
 ```
 
-### Temperature probe name
+## Temperature probe name
 
-Enter the name used after `temperature_probe`.
+Use the name after:
+
+```ini
+[temperature_probe ...]
+```
 
 For example:
 
@@ -226,21 +442,23 @@ For example:
 [temperature_probe btt_eddy]
 ```
 
-would use:
+uses:
 
 ```text
 btt_eddy
 ```
 
-If your probe does not expose a temperature probe, leave this field blank.
+If there is no separate temperature probe object, leave this field blank.
 
-## Calibration data
+---
 
-The calibration-equivalent Z display uses the probe's existing Klipper calibration table.
+# BTT Eddy calibration data
 
-The calibration can be copied directly from the `SAVE_CONFIG` section at the bottom of `printer.cfg`.
+The calibration-equivalent Z graph uses the existing Klipper Eddy calibration table.
 
-For example:
+Copy the `calibrate =` block from the `SAVE_CONFIG` section at the bottom of `printer.cfg`.
+
+Example:
 
 ```ini
 #*# [probe_eddy_current btt_eddy]
@@ -252,9 +470,9 @@ For example:
 #*#   0.410000:676981.183,0.450000:676828.249,0.490000:676671.691
 ```
 
-You do not need to clean the text before pasting it.
+Paste the block directly into the dashboard.
 
-The parser extracts numeric pairs in the form:
+The parser extracts pairs in the form:
 
 ```text
 Z:frequency
@@ -266,7 +484,7 @@ For example:
 0.050000:678437.389
 ```
 
-The parser ignores surrounding text such as:
+It ignores surrounding text such as:
 
 ```text
 calibrate =
@@ -275,95 +493,223 @@ calibrate =
 
 and line breaks.
 
-After pasting the calibration, click **Save settings**.
+---
 
-The dashboard will report how many calibration points were detected.
+# BTT Eddy calibration-equivalent Z
 
-## Calibration-equivalent Z
+The dashboard converts the measured frequency into Z using linear interpolation between the saved calibration points.
 
-The green Z graph is calculated by linearly interpolating between the calibration points supplied by Klipper.
+The displayed value means:
 
-It should be treated as:
+> the Z position that corresponds to the current measured frequency according to the stored Klipper calibration.
 
-> the Z position that corresponds to the currently measured frequency according to the stored probe calibration.
-
-It is useful for observing apparent probe movement and drift.
+It is useful for measuring apparent sensor drift.
 
 It is not necessarily the true physical distance between the probe and the target.
 
-This is especially important if the probe is positioned outside the distance range represented by the calibration table.
+This is especially important if the probe is outside the calibrated sensing range.
 
-The dashboard deliberately does not extrapolate beyond the supplied calibration range.
+The dashboard deliberately does not extrapolate beyond the pasted calibration range.
 
-If the measured frequency is outside that range, it displays:
+If the current frequency is outside the calibration table, the dashboard displays:
 
 ```text
-Out of calibration
+No distance
 ```
 
-## Reset baseline
+---
 
-The **Reset baseline** button stores the current values as the new reference point.
+# Cartographer V3 configuration
+
+When **Cartographer V3 / Scanner plugin** is selected, the BTT Eddy sensor-name and calibration fields are not required.
+
+The dashboard reads Cartographer's live data from:
+
+```text
+cartographer.mcu.last_sample
+```
+
+---
+
+# Cartographer scan model
+
+To calculate Cartographer model distance, paste the complete scan-model block from `SAVE_CONFIG`.
+
+Example:
+
+```ini
+#*# [cartographer scan_model default]
+#*# coefficients = 1.4142270210736863,1.8858165705181558,0.8609574640872374,0.4194478576326323,0.35267133207875817,0.392660166158967,-0.10864201080375517,-0.22252968570372833,0.28264700523301084,0.22721290980476372
+#*# domain = 3.190766648414659e-07,3.338151076700032e-07
+#*# z_offset = 0
+#*# reference_temperature = 28.82
+#*# software_version = 1.9.0
+#*# mcu_version = CARTOGRAPHER V3 6.1.0
+```
+
+The dashboard extracts:
+
+```text
+coefficients
+domain
+z_offset
+reference_temperature
+```
+
+The important values used for distance conversion are:
+
+```text
+coefficients
+domain
+z_offset
+```
+
+---
+
+# Cartographer model distance
+
+Cartographer's scan model is a polynomial evaluated against inverse sensor frequency.
+
+Conceptually:
+
+```text
+frequency
+    │
+    ▼
+1 / frequency
+    │
+    ▼
+Cartographer polynomial model
+    │
+    ▼
+distance
+```
+
+The dashboard reproduces the scan-model polynomial from the pasted:
+
+```text
+coefficients =
+domain =
+```
+
+data.
+
+This allows the third graph to display Cartographer model distance rather than BTT-style calibration-equivalent Z.
+
+---
+
+# Cartographer temperature compensation
+
+The Cartographer scan model includes:
+
+```text
+reference_temperature
+```
+
+However, Cartographer can also use a separate coil temperature-compensation calibration.
+
+The current dashboard does **not** reproduce an optional separate Cartographer coil temperature-compensation curve.
+
+If no additional coil compensation model is configured, the scan-model conversion is sufficient.
+
+If a separate temperature-compensation model is active, there may be a difference between the dashboard's calculated distance and Cartographer's internally compensated result.
+
+---
+
+# Reset baseline
+
+The **Reset baseline** button stores the current values as the reference.
 
 After resetting:
 
 ```text
-Frequency change = 0 Hz
+Frequency change   = 0 Hz
 Temperature change = 0 °C
-Z change = 0 µm
-Frequency drift = 0 ppm
+Z change           = 0 µm
+Frequency drift    = 0 ppm
 ```
 
 This does not change anything in Klipper.
 
-It only changes the reference used by the dashboard.
+It only changes the dashboard's reference values.
 
-This is useful when testing:
+This is useful when comparing:
 
 - probe warm-up
-- thermal drift
-- different `reg_drive_current` settings
 - different probe heights
-- bed temperature changes
-- electronics temperature changes
-- repeatability
-- long-duration stability
+- different target materials
+- bed-temperature changes
+- sensor-temperature changes
+- different `reg_drive_current` values
+- electronics changes
+- long-duration drift
 
-## Frequency drift in ppm
+---
 
-The dashboard reports relative frequency movement in parts per million:
+# Frequency drift in ppm
 
-```text
-ppm = (current_frequency - baseline_frequency)
-      / baseline_frequency
-      × 1,000,000
-```
-
-For example, if a probe starts at:
+Frequency drift is shown in parts per million:
 
 ```text
-675000 Hz
+ppm =
+(current_frequency - baseline_frequency)
+----------------------------------------
+          baseline_frequency
+
+× 1,000,000
 ```
 
-and increases by:
+Equivalent formula:
 
 ```text
-337.5 Hz
+ppm = Δfrequency / baseline_frequency × 1,000,000
 ```
 
-the drift is:
+For example:
 
 ```text
-500 ppm
+Baseline frequency = 675000 Hz
+Frequency change   = +337.5 Hz
 ```
 
-Using ppm makes it easier to compare drift between tests performed at different sensor frequencies.
+gives:
 
-## Graph windows
+```text
++500 ppm
+```
 
-The graph window can be changed from the dashboard.
+Using ppm makes it easier to compare drift at different absolute sensor frequencies.
 
-Available options are:
+---
+
+# Graph layout
+
+The desktop layout is designed to fit on one browser screen.
+
+The four live values are shown in a column on the left:
+
+```text
+Frequency
+Probe temperature
+Z / Cartographer distance
+Frequency drift
+```
+
+The right side contains three separate scrolling graph rows:
+
+```text
+Frequency
+Temperature
+Z / distance
+```
+
+The dashboard automatically falls back to a stacked layout on smaller screens.
+
+---
+
+# Graph windows
+
+Available windows:
 
 ```text
 1 minute
@@ -372,25 +718,25 @@ Available options are:
 1 hour
 ```
 
-The graphs scroll continuously as new data arrives.
+The graphs continuously scroll as new samples arrive.
 
-The server stores recent samples in memory so changing the graph window does not immediately discard previously collected data.
+Recent samples are kept in memory so switching the graph window can display earlier samples from the current session.
 
-## Automatic startup with systemd
+---
 
-After confirming that the dashboard works correctly, create a systemd service.
+# Automatic startup with systemd
 
-Create:
+After confirming the dashboard works manually, create:
 
 ```bash
 sudo nano /etc/systemd/system/eddy-dashboard.service
 ```
 
-Example configuration:
+Example:
 
 ```ini
 [Unit]
-Description=Eddy Live Dashboard
+Description=Eddy / Cartographer Live Dashboard
 After=network.target klipper.service moonraker.service
 Wants=klipper.service moonraker.service
 
@@ -418,7 +764,7 @@ and:
 /home/voron/
 ```
 
-if your Klipper host uses a different username or home directory.
+if your Klipper host uses a different username.
 
 Reload systemd:
 
@@ -426,13 +772,13 @@ Reload systemd:
 sudo systemctl daemon-reload
 ```
 
-Enable and start the dashboard:
+Enable and start:
 
 ```bash
 sudo systemctl enable --now eddy-dashboard
 ```
 
-Check its status:
+Check status:
 
 ```bash
 systemctl status eddy-dashboard --no-pager
@@ -444,23 +790,25 @@ View live logs:
 journalctl -u eddy-dashboard -f
 ```
 
-Restart the service after updating the script:
+Restart after updating:
 
 ```bash
 sudo systemctl restart eddy-dashboard
 ```
 
-## Configuration storage
+---
 
-User settings are stored in:
+# Configuration storage
+
+Settings are saved in:
 
 ```text
 eddy_dashboard_config.json
 ```
 
-in the same directory as the Python script.
+in the same directory as the script.
 
-An example installation may therefore look like:
+Example:
 
 ```text
 ~/eddy-dashboard/
@@ -469,31 +817,13 @@ An example installation may therefore look like:
 └── venv/
 ```
 
-The configuration file is created automatically when settings are saved.
+The file is created automatically after saving Settings.
 
-You normally do not need to edit it manually.
+---
 
-## Example Klipper configuration
+# Troubleshooting
 
-A probe may look similar to:
-
-```ini
-[probe_eddy_current btt_eddy]
-sensor_type: ldc1612
-# additional probe configuration...
-
-[temperature_probe btt_eddy]
-sensor_type: Generic 3950
-# additional temperature configuration...
-```
-
-The exact configuration depends on the probe and hardware.
-
-The dashboard does not require these sections to have the name `btt_eddy`; the names can be entered through the Settings menu.
-
-## Troubleshooting
-
-### Dashboard says Disconnected
+## Dashboard says Disconnected
 
 Confirm Moonraker is running:
 
@@ -501,113 +831,192 @@ Confirm Moonraker is running:
 systemctl status moonraker
 ```
 
-Check that Moonraker is available:
+Check the configured host and port.
+
+For a dashboard running on the Klipper host, the usual values are:
 
 ```text
-http://PRINTER_IP:7125
+Host: 127.0.0.1
+Port: 7125
 ```
 
-Verify that the dashboard's Moonraker host and port are correct.
+---
 
-If the dashboard runs directly on the Klipper host, the recommended host setting is:
+## BTT Eddy: `ldc1612/dump_ldc1612` not found
+
+If the terminal shows:
 
 ```text
-127.0.0.1
+No registered callback for path 'ldc1612/dump_ldc1612'
 ```
 
-and the normal Moonraker port is:
+the configured probe is not exposing Klipper's LDC1612 dump endpoint.
+
+This is expected when using Cartographer.
+
+Switch the dashboard Probe Type to:
 
 ```text
-7125
+Cartographer V3 / Scanner plugin
 ```
 
-### Klipper LDC stream does not connect
+---
 
-The dashboard uses:
+## Cartographer: `scanner/dump` not found
+
+Older Cartographer implementations used different interfaces.
+
+The current Cartographer3D plugin does not require:
 
 ```text
-ldc1612/dump_ldc1612
+scanner/dump
 ```
 
-Your probe must use Klipper's LDC1612 implementation and expose that diagnostic endpoint.
+The dashboard instead reads:
 
-Check the console output:
+```text
+cartographer
+```
+
+from Klipper's object status.
+
+To verify the object exists:
 
 ```bash
-python3 eddy_dashboard.py
+curl -s http://localhost:7125/printer/objects/list \
+  | python3 -m json.tool \
+  | grep -i cartographer -C 2
 ```
 
-or, when using systemd:
+You should see entries similar to:
+
+```text
+mcu cartographer
+temperature_sensor cartographer_coil
+cartographer
+temperature_sensor cartographer
+```
+
+---
+
+## Verify Cartographer live data manually
+
+Run:
+
+```bash
+curl -s 'http://localhost:7125/printer/objects/query?cartographer' \
+  | python3 -m json.tool
+```
+
+A working installation should contain something similar to:
+
+```json
+{
+    "cartographer": {
+        "mcu": {
+            "last_sample": {
+                "frequency": 2972395.24,
+                "time": 145372.78,
+                "temperature": 32.44,
+                "raw_count": 33245678
+            }
+        }
+    }
+}
+```
+
+---
+
+## Cartographer frequency is visible but not changing
+
+The Cartographer plugin normally stops continuous MCU sampling while idle.
+
+The dashboard automatically starts:
+
+```text
+CARTOGRAPHER_STREAM ACTION=START
+```
+
+If the stream cannot be started, check the dashboard terminal output or:
 
 ```bash
 journalctl -u eddy-dashboard -f
 ```
 
-### No temperature is displayed
+---
 
-Verify that your Klipper configuration has a matching temperature object.
+## Cartographer distance says `No distance`
 
-For example:
+Possible causes:
 
-```ini
-[temperature_probe btt_eddy]
-```
+- no Cartographer scan model has been pasted
+- the model block could not be parsed
+- the current inverse frequency is outside the model's domain
+- the wrong scan model was pasted
 
-Then enter:
+Paste the full:
 
 ```text
-btt_eddy
+[cartographer scan_model default]
 ```
 
-as the temperature probe name in Settings.
+block into Settings.
 
-If no temperature probe exists, leave the field blank.
+---
 
-### Z shows "Out of calibration"
+## BTT Eddy temperature is blank
 
-This means the measured sensor frequency is outside the frequency range contained in the pasted calibration table.
+Verify that Klipper has a matching:
 
-This may happen when:
+```ini
+[temperature_probe ...]
+```
 
-- the probe is far above the bed
-- the probe is near a different metal target
-- the calibration belongs to a different probe
-- the calibration has not been pasted
-- the probe frequency has moved outside the calibrated range
+object.
 
-The dashboard intentionally does not extrapolate Z outside the calibration table.
+If no separate temperature probe exists, leave the field blank.
 
-### Calibration data is rejected
+---
+
+## Cartographer temperature
+
+Cartographer temperature comes directly from:
+
+```text
+cartographer.mcu.last_sample.temperature
+```
+
+No separate temperature-probe name is required in Cartographer mode.
+
+---
+
+## BTT Eddy calibration data is rejected
 
 At least two valid calibration pairs are required.
 
-Valid pairs look like:
+A valid pair looks like:
 
 ```text
 0.050000:678437.389
 ```
 
-You can normally paste the complete `calibrate =` section directly from `printer.cfg`.
+Paste the entire `calibrate =` block directly from `printer.cfg`.
 
-### Port 8085 is already in use
+---
 
-Check what is using the port:
+## Port 8085 is already in use
+
+Check:
 
 ```bash
 sudo ss -ltnp | grep 8085
 ```
 
-Stop the other process or change:
+Stop the conflicting process or change the dashboard web port.
 
-```python
-"web_port": 8085
-```
+---
 
-in the default configuration before the first run.
-
-If a configuration file already exists, the saved configuration will be used.
-
-## Security
+# Security
 
 The dashboard is intended for use on a trusted local network.
 
@@ -617,55 +1026,70 @@ By default it listens on:
 0.0.0.0:8085
 ```
 
-which allows other devices on the local network to open it.
+which makes it accessible to devices on the LAN.
 
 There is currently no built-in authentication.
 
 Do not expose port `8085` directly to the public Internet.
 
-The dashboard is read-only with respect to Klipper, but the web interface itself should still be treated as a local diagnostic service.
+---
 
-## Does this modify Klipper?
+# Does this modify Klipper?
 
-No.
-
-The application does not modify:
+The dashboard does not modify:
 
 - `printer.cfg`
-- Klipper source files
-- probe calibration
-- `reg_drive_current`
-- Z offset
+- Klipper source
 - firmware
+- probe calibration
+- Z offset
+- `reg_drive_current`
 - MCU configuration
-- printer movement
+- printer motion
 - heater state
 
-It subscribes to diagnostic data and reads temperature information.
+In BTT Eddy mode, operation is read-only.
 
-The **Reset baseline** button only changes values stored inside the dashboard.
+In Cartographer mode, the dashboard additionally starts and stops the plugin's diagnostic stream using:
 
-## Performance
+```text
+CARTOGRAPHER_STREAM ACTION=START
+CARTOGRAPHER_STREAM ACTION=CANCEL
+```
 
-The LDC1612 sensor can produce data at a high sample rate.
+This is required to keep Cartographer's live MCU sample updating while the printer is idle.
 
-Rather than sending every raw sample directly to the browser, the dashboard averages each incoming Klipper batch and plots the resulting point.
+It does not perform probing, homing, calibration, or motion.
 
-This keeps the live display responsive while still preserving small frequency changes and long-term drift trends.
+---
 
-The dashboard is intended for diagnostics rather than replacing Klipper's internal probe calculations.
+# Performance
 
-## Known limitations
+LDC-based probes can produce data at a high sample rate.
 
-- Requires a Klipper probe that exposes the `ldc1612/dump_ldc1612` endpoint.
-- Calibration-equivalent Z is only valid within the supplied calibration frequency range.
-- Temperature support depends on a matching `temperature_probe` object.
-- No authentication is currently included.
-- Data is currently stored in memory only.
-- Closing or restarting the application clears the graph history.
+For BTT Eddy, the dashboard averages each incoming Klipper data batch before displaying it.
+
+For Cartographer, the dashboard reads the most recent MCU sample through the Klipper status object and only adds a graph point when the sample timestamp changes.
+
+The browser therefore receives a much smaller data set than the probe's raw internal sampling rate.
+
+---
+
+# Known limitations
+
+- BTT Eddy requires the `ldc1612/dump_ldc1612` endpoint.
+- BTT Z conversion is only valid inside the pasted calibration range.
+- Cartographer requires the current `cartographer` Klipper status object.
+- Cartographer model conversion requires a pasted scan model.
+- Optional separate Cartographer coil temperature-compensation calibration is not currently reproduced.
+- No built-in authentication.
+- Graph history is currently stored in RAM only.
+- Restarting the dashboard clears graph history.
 - CSV recording is not currently included.
 
-## Updating
+---
+
+# Updating
 
 Replace:
 
@@ -673,7 +1097,9 @@ Replace:
 eddy_dashboard.py
 ```
 
-with the newer version and restart the service:
+with the new version.
+
+If using systemd:
 
 ```bash
 sudo systemctl restart eddy-dashboard
@@ -687,32 +1113,43 @@ source venv/bin/activate
 python3 eddy_dashboard.py
 ```
 
-## Removing
+---
 
-Stop and disable the service:
+# Removing
+
+Disable the service:
 
 ```bash
 sudo systemctl disable --now eddy-dashboard
 ```
 
-Remove the service file:
+Remove the service:
 
 ```bash
 sudo rm /etc/systemd/system/eddy-dashboard.service
 sudo systemctl daemon-reload
 ```
 
-Remove the dashboard directory if desired:
+Remove the application directory if desired:
 
 ```bash
 rm -rf ~/eddy-dashboard
 ```
 
-## Disclaimer
+---
+
+# Disclaimer
 
 This project is a diagnostic tool.
 
-Always verify probe behavior using the normal Klipper calibration and printer setup procedures before relying on measurements for printer operation.
+Always verify probe behavior using the normal Klipper and probe-manufacturer calibration/setup procedures before relying on measurements for printer operation.
 
-Do not use the dashboard's calibration-equivalent Z value as a replacement for Klipper's normal probing, homing, Z-offset, or safety logic.
+Do not use the dashboard's calculated Z or Cartographer model-distance value as a replacement for Klipper's normal:
 
+- homing
+- probing
+- Z-offset handling
+- bed leveling
+- safety logic
+
+---
