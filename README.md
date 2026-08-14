@@ -74,8 +74,20 @@ Selectable history windows:
 ### General
 
 - User-configurable Moonraker host and port
+- Automatic BTT Eddy / Cartographer probe detection
+- Automatic BTT Eddy calibration discovery
+- Automatic Cartographer scan-model discovery
+- Configurable rolling sample averaging
+- Configurable graph colors
+- Start/stop CSV recording
+- Download recorded CSV files from the browser
+- Automatic test timer
+- Live min/max/standard-deviation statistics
+- Drift-rate statistics in Hz/min, ppm/min, and µm/min
+- Recorded-run comparison
 - Settings saved between restarts
 - Automatically reconnects after interruptions
+- Quiet terminal output with useful startup URL information
 - Read-only with respect to normal printer operation
 - No Klipper source modification required
 - No firmware modification required
@@ -200,10 +212,10 @@ CARTOGRAPHER_STREAM ACTION=START
 
 through Moonraker.
 
-When the dashboard stops or changes modes, it cancels the stream with:
+When the dashboard stops or changes modes, it stops the stream with:
 
 ```text
-CARTOGRAPHER_STREAM ACTION=CANCEL
+CARTOGRAPHER_STREAM ACTION=STOP
 ```
 
 The dashboard also periodically recycles the stream session.
@@ -326,11 +338,18 @@ python3 eddy_dashboard.py
 You should see output similar to:
 
 ```text
-Eddy dashboard starting on port 8085
+Probe auto-detection: Detected Cartographer.
+Using Cartographer scanner status stream
+Using Cartographer object: cartographer
 
- * Running on http://127.0.0.1:8085
- * Running on http://<printer-ip>:8085
+Eddy dashboard starting
+  Port:       8085
+  Local:      http://127.0.0.1:8085
+  Network:    http://<printer-ip>:8085
 ```
+
+Normal Flask request logs are intentionally suppressed so the terminal stays readable. Meaningful connection, stream, and persistent error messages are still shown.
+
 
 Open:
 
@@ -361,6 +380,42 @@ The Settings window can be closed using:
 - the **Close** button
 - the `Esc` key
 
+## Auto detection
+
+By default, the dashboard attempts to detect the installed probe automatically at startup.
+
+It checks Klipper's loaded objects and can detect:
+
+```text
+cartographer
+```
+
+or:
+
+```text
+probe_eddy_current <name>
+```
+
+For BTT Eddy, it also attempts to detect:
+
+- the Eddy sensor name
+- a matching `temperature_probe`
+- the saved `calibrate =` table
+
+For Cartographer, it also attempts to detect:
+
+- the `cartographer` status object
+- the active scan model
+- the saved Cartographer scan-model coefficients/domain
+
+You can run detection manually at any time with:
+
+```text
+Settings → Auto Detect Now
+```
+
+Automatic detection can be disabled in Settings if you prefer to configure the probe manually.
+
 ---
 
 # Probe type
@@ -374,7 +429,7 @@ BTT Eddy / Klipper LDC1612
 or:
 
 ```text
-Cartographer V3 / Scanner plugin
+Cartographer V3 / Cartographer3D
 ```
 
 ---
@@ -451,7 +506,9 @@ If there is no separate temperature probe object, leave this field blank.
 
 The calibration-equivalent Z graph uses the existing Klipper Eddy calibration table.
 
-Copy the `calibrate =` block from the `SAVE_CONFIG` section at the bottom of `printer.cfg`.
+The dashboard can usually discover the saved `calibrate =` table automatically from Klipper.
+
+If automatic discovery is unavailable or you want to override it manually, copy the `calibrate =` block from the `SAVE_CONFIG` section at the bottom of `printer.cfg`.
 
 Example:
 
@@ -516,7 +573,7 @@ No distance
 
 # Cartographer V3 configuration
 
-When **Cartographer V3 / Scanner plugin** is selected, the BTT Eddy sensor-name and calibration fields are not required.
+When **Cartographer V3 / Cartographer3D** is selected, the BTT Eddy sensor-name and calibration fields are not required.
 
 The dashboard reads Cartographer's live data from:
 
@@ -528,7 +585,9 @@ cartographer.mcu.last_sample
 
 # Cartographer scan model
 
-To calculate Cartographer model distance, paste the complete scan-model block from `SAVE_CONFIG`.
+The dashboard can usually discover the active Cartographer scan model automatically from Klipper.
+
+If automatic discovery is unavailable or you want to override it manually, paste the complete scan-model block from `SAVE_CONFIG`.
 
 Example:
 
@@ -719,6 +778,230 @@ Recent samples are kept in memory so switching the graph window can display earl
 
 ---
 
+# Session menu
+
+The **Session** menu contains the controls used during a drift or stability test.
+
+Available actions include:
+
+- Start test
+- Stop test
+- Reset timer
+- Reset baseline
+- Start CSV recording
+- Stop CSV recording
+- Download last CSV
+
+The dashboard also provides quick **Start Test** and **Record CSV** buttons beside the live-value cards.
+
+---
+
+# Automatic test timer
+
+Starting a test:
+
+```text
+Session → Start test
+```
+
+does two things:
+
+1. resets the current measurement baseline
+2. starts the elapsed test timer
+
+Stopping a test freezes the timer.
+
+Resetting the timer clears the test time without affecting the probe or printer.
+
+The timer is displayed in the top toolbar.
+
+---
+
+# CSV recording
+
+Start a recording with:
+
+```text
+Session → Start CSV recording
+```
+
+You can optionally enter a recording label.
+
+Recorded files are stored in:
+
+```text
+~/eddy-dashboard/recordings/
+```
+
+Each CSV contains:
+
+```text
+wall_time_iso
+wall_time_unix
+sensor_time
+frequency_hz
+temperature_c
+z_or_distance_mm
+probe_type
+```
+
+CSV recording uses the dashboard's configured rolling-average output, not every raw MCU sample.
+
+Stop recording with:
+
+```text
+Session → Stop CSV recording
+```
+
+The most recently completed recording can be downloaded with:
+
+```text
+Session → Download last CSV
+```
+
+Recorded files can also be downloaded from the Recorded Runs window.
+
+---
+
+# Live statistics
+
+Open:
+
+```text
+Data → Statistics
+```
+
+Statistics are calculated over the currently selected graph window.
+
+For frequency, the dashboard displays:
+
+- minimum
+- maximum
+- standard deviation
+- drift rate in Hz/min
+- drift rate in ppm/min
+
+For temperature:
+
+- minimum
+- maximum
+- standard deviation
+
+For Z / Cartographer distance:
+
+- minimum
+- maximum
+- standard deviation
+- drift rate in µm/min
+
+The drift rates are calculated using a linear least-squares fit over the displayed samples.
+
+---
+
+# Recorded-run comparison
+
+Open:
+
+```text
+Data → Recorded runs / Compare
+```
+
+The dashboard lists saved CSV recordings and allows multiple runs to be selected.
+
+Comparison options include:
+
+```text
+Frequency Δ (Hz)
+Frequency drift (ppm)
+Z/distance Δ (µm)
+Temperature Δ (°C)
+```
+
+Each run is normalized to its own starting value and plotted against elapsed time.
+
+This makes it easier to compare tests such as:
+
+- different probe heights
+- cold-start vs warmed-up behavior
+- different bed temperatures
+- different target materials
+- different BTT Eddy drive-current values
+- hardware or electronics changes
+
+Up to several runs can be displayed together.
+
+---
+
+# Sample averaging
+
+The dashboard supports configurable rolling sample averaging.
+
+Open:
+
+```text
+Settings → Rolling sample average
+```
+
+The allowed range is:
+
+```text
+1 to 200 samples
+```
+
+A value of:
+
+```text
+1
+```
+
+disables additional dashboard-side averaging.
+
+Higher values smooth short-term noise but also reduce responsiveness to fast changes.
+
+CSV recordings and graph points use the averaged values.
+
+---
+
+# Graph colors
+
+Frequency, temperature, and Z/distance graph colors can be changed from Settings.
+
+Available configurable colors are:
+
+- Frequency graph
+- Temperature graph
+- Z/distance graph
+
+The selected colors are saved in `eddy_dashboard_config.json`.
+
+---
+
+# Interface overview
+
+The main dashboard is intentionally kept simple.
+
+The top toolbar contains:
+
+```text
+Connection status
+Recording status
+Test timer
+Graph window
+Session menu
+Data menu
+Settings
+```
+
+The **Session** menu contains test and recording controls.
+
+The **Data** menu contains statistics and recorded-run comparison.
+
+The **Settings** dialog contains connection settings, automatic detection, averaging, graph colors, and manual calibration/model overrides.
+
+This keeps the live monitoring view uncluttered while still exposing the more advanced diagnostic tools when needed.
+
+---
+
 # Automatic startup with systemd
 
 After confirming the dashboard works manually, create:
@@ -809,6 +1092,8 @@ Example:
 ~/eddy-dashboard/
 ├── eddy_dashboard.py
 ├── eddy_dashboard_config.json
+├── recordings/
+│   └── YYYYMMDD_HHMMSS_test-name.csv
 └── venv/
 ```
 
@@ -852,7 +1137,7 @@ This is expected when using Cartographer.
 Switch the dashboard Probe Type to:
 
 ```text
-Cartographer V3 / Scanner plugin
+Cartographer V3 / Cartographer3D
 ```
 
 ---
@@ -999,6 +1284,40 @@ Paste the entire `calibrate =` block directly from `printer.cfg`.
 
 ---
 
+## Cartographer says `Stream is already active`
+
+If a previous dashboard process was terminated before it could stop the Cartographer stream, Cartographer may report:
+
+```text
+Stream is already active
+```
+
+The current dashboard attempts to recover automatically by sending:
+
+```text
+CARTOGRAPHER_STREAM ACTION=STOP
+```
+
+and then starting a new stream.
+
+If recovery does not work, manually run:
+
+```text
+CARTOGRAPHER_STREAM ACTION=STOP
+```
+
+from the Klipper console and restart the dashboard.
+
+---
+
+## Occasional Cartographer timeout messages
+
+A single Moonraker/Cartographer status timeout can occur while Klipper is briefly busy.
+
+The dashboard suppresses isolated timeouts and only reports the problem in the terminal if read failures persist.
+
+---
+
 ## Port 8085 is already in use
 
 Check:
@@ -1049,7 +1368,7 @@ In Cartographer mode, the dashboard additionally starts and stops the plugin's d
 
 ```text
 CARTOGRAPHER_STREAM ACTION=START
-CARTOGRAPHER_STREAM ACTION=CANCEL
+CARTOGRAPHER_STREAM ACTION=STOP
 ```
 
 This is required to keep Cartographer's live MCU sample updating while the printer is idle.
@@ -1073,14 +1392,16 @@ The browser therefore receives a much smaller data set than the probe's raw inte
 # Known limitations
 
 - BTT Eddy requires the `ldc1612/dump_ldc1612` endpoint.
-- BTT Z conversion is only valid inside the pasted calibration range.
+- BTT Z conversion is only valid inside the discovered/pasted calibration range.
 - Cartographer requires the current `cartographer` Klipper status object.
-- Cartographer model conversion requires a pasted scan model.
+- Cartographer model distance requires a discovered or pasted scan model.
 - Optional separate Cartographer coil temperature-compensation calibration is not currently reproduced.
+- Probe/calibration/model auto-detection depends on the relevant Klipper objects and config data being exposed through Moonraker.
 - No built-in authentication.
-- Graph history is currently stored in RAM only.
-- Restarting the dashboard clears graph history.
-- CSV recording is not currently included.
+- Live graph history is stored in RAM only.
+- Restarting the dashboard clears live graph history.
+- Recorded CSV files are persistent until manually deleted.
+- Recorded-run comparison currently operates on dashboard-generated CSV files.
 
 ---
 
