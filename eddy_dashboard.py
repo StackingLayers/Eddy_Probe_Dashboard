@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import atexit
 import json
 import os
 import re
@@ -17,8 +18,10 @@ CONFIG_FILE = os.path.join(APP_DIR, "eddy_dashboard_config.json")
 DEFAULT_CONFIG = {
     "moonraker_host": "127.0.0.1",
     "moonraker_port": 7125,
+    "probe_type": "btt_eddy",
     "eddy_sensor_name": "btt_eddy",
     "temperature_probe_name": "btt_eddy",
+    "cartographer_model_text": "",
     "web_host": "0.0.0.0",
     "web_port": 8085,
     "calibration_text": ""
@@ -38,6 +41,9 @@ baseline_z = None
 
 config = dict(DEFAULT_CONFIG)
 cal_by_freq = []
+carto_model = None
+active_klipper_ws = None
+cartographer_stream_owned = False
 
 
 def load_config():
@@ -125,6 +131,117 @@ def frequency_to_z(freq):
     return None
 
 
+def parse_cartographer_model_text(text):
+    """
+    Parse the Cartographer scan model SAVE_CONFIG block.
+
+    Required:
+      coefficients = ...
+      domain = lower,upper
+
+    Optional:
+      z_offset = ...
+      reference_temperature = ...
+    """
+    if not text or not text.strip():
+        raise ValueError("Cartographer scan model data is empty.")
+
+    coeff_match = re.search(
+        r"(?im)^\s*(?:#\*#\s*)?coefficients\s*=\s*([^\r\n]+)",
+        text
+    )
+    domain_match = re.search(
+        r"(?im)^\s*(?:#\*#\s*)?domain\s*=\s*([^\r\n]+)",
+        text
+    )
+    z_match = re.search(
+        r"(?im)^\s*(?:#\*#\s*)?z_offset\s*=\s*([+-]?\d+(?:\.\d+)?(?:e[+-]?\d+)?)",
+        text
+    )
+    temp_match = re.search(
+        r"(?im)^\s*(?:#\*#\s*)?reference_temperature\s*=\s*([+-]?\d+(?:\.\d+)?(?:e[+-]?\d+)?)",
+        text
+    )
+
+    if not coeff_match or not domain_match:
+        raise ValueError(
+            "Could not find both 'coefficients =' and 'domain =' in the Cartographer scan model."
+        )
+
+    def numbers(value):
+        return [
+            float(x)
+            for x in re.findall(
+                r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?",
+                value,
+                re.I
+            )
+        ]
+
+    coefficients = numbers(coeff_match.group(1))
+    domain = numbers(domain_match.group(1))
+
+    if len(coefficients) < 2:
+        raise ValueError("Cartographer model has too few coefficients.")
+
+    if len(domain) != 2 or domain[0] == domain[1]:
+        raise ValueError("Cartographer model domain is invalid.")
+
+    return {
+        "coefficients": coefficients,
+        "domain": domain,
+        "z_offset": float(z_match.group(1)) if z_match else 0.0,
+        "reference_temperature": float(temp_match.group(1)) if temp_match else None
+    }
+
+
+def cartographer_frequency_to_distance(frequency):
+    """
+    Reproduce Cartographer's raw scan-model Polynomial evaluation.
+
+    Cartographer constructs:
+        Polynomial(coefficients, domain=domain)
+
+    NumPy Polynomial maps 'domain' onto the default window [-1, 1],
+    so we perform the same mapping here without adding NumPy as a dependency.
+
+    This does not apply an optional Cartographer coil temperature-compensation
+    calibration. With no coil temperature-compensation model configured, this
+    matches the scan model's frequency-to-distance calculation.
+    """
+    if carto_model is None or frequency is None or frequency <= 0:
+        return None
+
+    lower, upper = carto_model["domain"]
+    inverse_frequency = 1.0 / float(frequency)
+
+    # Match Cartographer: outside the model's inverse-frequency domain is invalid.
+    if inverse_frequency < min(lower, upper) or inverse_frequency > max(lower, upper):
+        return None
+
+    # Polynomial domain -> default window [-1, 1]
+    y = (2.0 * inverse_frequency - (lower + upper)) / (upper - lower)
+
+    value = 0.0
+    power = 1.0
+    for coefficient in carto_model["coefficients"]:
+        value += coefficient * power
+        power *= y
+
+    return value + carto_model["z_offset"]
+
+
+def rebuild_cartographer_model():
+    global carto_model
+
+    model_text = config.get("cartographer_model_text", "")
+    if not model_text.strip():
+        carto_model = None
+        return
+
+    carto_model = parse_cartographer_model_text(model_text)
+
+
 def moonraker_http_url(path):
     host = config["moonraker_host"]
     port = config["moonraker_port"]
@@ -142,6 +259,12 @@ def temperature_worker():
 
     while True:
         try:
+            if config.get("probe_type", "btt_eddy") == "cartographer":
+                with lock:
+                    latest_temperature = None
+                time.sleep(1.0)
+                continue
+
             name = config.get("temperature_probe_name", "").strip()
 
             if not name:
@@ -171,13 +294,222 @@ def temperature_worker():
         time.sleep(1.0)
 
 
-def klipper_worker():
-    global connected
+def append_history_point(frequency, temp, z, sensor_time=None):
     global baseline_frequency
     global baseline_temperature
     global baseline_z
 
+    if sensor_time is None:
+        sensor_time = time.monotonic()
+
+    with lock:
+        if baseline_frequency is None:
+            baseline_frequency = frequency
+
+        if baseline_temperature is None and temp is not None:
+            baseline_temperature = temp
+
+        if baseline_z is None and z is not None:
+            baseline_z = z
+
+        history.append({
+            "sensor_time": sensor_time,
+            "wall_time": time.time(),
+            "frequency": frequency,
+            "temperature": temp,
+            "z": z
+        })
+
+
+def run_gcode_script(script):
+    """Run one G-code command through Moonraker."""
+    url = moonraker_http_url("/printer/gcode/script")
+    body = json.dumps({"script": script}).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST"
+    )
+
+    with urllib.request.urlopen(req, timeout=5) as response:
+        raw = response.read().decode("utf-8")
+        if raw:
+            try:
+                return json.loads(raw)
+            except json.JSONDecodeError:
+                return raw
+        return None
+
+
+def start_cartographer_stream():
+    """
+    Start the Cartographer plugin's own stream session.
+
+    The current Cartographer3D plugin only updates mcu.last_sample while its
+    MCU stream is active. CARTOGRAPHER_STREAM starts a plugin-owned Session.
+    """
+    global cartographer_stream_owned
+
+    if cartographer_stream_owned:
+        return True
+
+    try:
+        run_gcode_script("CARTOGRAPHER_STREAM ACTION=START")
+        cartographer_stream_owned = True
+        print("Cartographer live stream started")
+        return True
+    except Exception as e:
+        # If another Cartographer stream session is already active, last_sample
+        # may still be live. Do not cancel a session we did not create.
+        print("Could not start Cartographer stream:", e)
+        return False
+
+
+def stop_cartographer_stream():
+    """Cancel only the CARTOGRAPHER_STREAM session started by this dashboard."""
+    global cartographer_stream_owned
+
+    if not cartographer_stream_owned:
+        return
+
+    try:
+        run_gcode_script("CARTOGRAPHER_STREAM ACTION=CANCEL")
+        print("Cartographer live stream stopped")
+    except Exception as e:
+        print("Could not stop Cartographer stream:", e)
+    finally:
+        cartographer_stream_owned = False
+
+
+atexit.register(stop_cartographer_stream)
+
+
+
+def cartographer_worker():
+    """
+    Read live Cartographer3D Plugin v1.x data.
+
+    The live object is 'cartographer', with:
+        cartographer.mcu.last_sample.frequency
+        cartographer.mcu.last_sample.temperature
+        cartographer.mcu.last_sample.time
+
+    The plugin normally stops MCU streaming while idle. The dashboard starts
+    CARTOGRAPHER_STREAM to keep last_sample updating, then periodically recycles
+    that session so the plugin's in-memory sample list cannot grow forever.
+    """
+    global connected
+    global cartographer_stream_owned
+
+    last_sample_time = None
+    last_fresh_wall = 0.0
+    last_recycle_wall = time.time()
+
+    print("Using Cartographer object: cartographer")
+    start_cartographer_stream()
+
+    try:
+        while config.get("probe_type", "btt_eddy") == "cartographer":
+            try:
+                encoded = urllib.parse.quote("cartographer", safe="")
+                url = moonraker_http_url(
+                    f"/printer/objects/query?{encoded}"
+                )
+
+                with urllib.request.urlopen(url, timeout=2) as response:
+                    data = json.loads(response.read().decode())
+
+                status = data["result"]["status"]["cartographer"]
+                sample = (
+                    status.get("mcu", {})
+                          .get("last_sample")
+                )
+
+                if not sample:
+                    connected = False
+
+                    if not cartographer_stream_owned:
+                        start_cartographer_stream()
+
+                    time.sleep(0.1)
+                    continue
+
+                frequency = float(sample["frequency"])
+                temp = (
+                    float(sample["temperature"])
+                    if sample.get("temperature") is not None
+                    else None
+                )
+                sample_time = (
+                    float(sample["time"])
+                    if sample.get("time") is not None
+                    else None
+                )
+
+                # Only append when Cartographer supplied a new MCU sample.
+                if sample_time != last_sample_time:
+                    last_sample_time = sample_time
+                    last_fresh_wall = time.time()
+                    connected = True
+
+                    z = cartographer_frequency_to_distance(frequency)
+
+                    append_history_point(
+                        frequency,
+                        temp,
+                        z,
+                        sample_time if sample_time is not None else time.monotonic()
+                    )
+
+                # If the sample stopped changing, try to restore a stream.
+                elif time.time() - last_fresh_wall > 2.0:
+                    connected = False
+
+                    if not cartographer_stream_owned:
+                        start_cartographer_stream()
+
+                # CARTOGRAPHER_STREAM stores every sample in a Python list.
+                # Recycle our session every 10 seconds to keep its memory bounded.
+                if (
+                    cartographer_stream_owned
+                    and time.time() - last_recycle_wall >= 10.0
+                ):
+                    stop_cartographer_stream()
+                    time.sleep(0.05)
+                    start_cartographer_stream()
+                    last_recycle_wall = time.time()
+
+            except Exception as e:
+                connected = False
+                print("Cartographer status read error:", e)
+                time.sleep(0.5)
+                continue
+
+            # Poll the Klipper status object at 20 Hz.
+            time.sleep(0.05)
+
+    finally:
+        connected = False
+        stop_cartographer_stream()
+
+
+def klipper_worker():
+    global connected
+    global active_klipper_ws
+
     while True:
+        probe_type = config.get("probe_type", "btt_eddy")
+
+        if probe_type == "cartographer":
+            print("Using Cartographer scanner status stream")
+            cartographer_worker()
+
+            if config.get("probe_type", "btt_eddy") == "cartographer":
+                time.sleep(1.0)
+
+            continue
+
         sensor_name = config.get("eddy_sensor_name", "").strip()
 
         if not sensor_name:
@@ -189,7 +521,7 @@ def klipper_worker():
             def on_open(ws):
                 global connected
                 connected = True
-                print("Connected to Klipper LDC stream")
+                print("Connected to Klipper LDC1612 stream")
 
                 ws.send(json.dumps({
                     "id": 1,
@@ -200,43 +532,48 @@ def klipper_worker():
                 }))
 
             def on_message(ws, message):
-                global baseline_frequency
-                global baseline_temperature
-                global baseline_z
-
                 try:
                     msg = json.loads(message)
                 except Exception:
+                    return
+
+                if msg.get("id") == 1 and "error" in msg:
+                    print("Klipper stream error:", msg["error"])
                     return
 
                 samples = msg.get("params", {}).get("data", [])
                 if not samples:
                     return
 
-                frequencies = [float(sample[1]) for sample in samples]
-                sensor_times = [float(sample[0]) for sample in samples]
+                frequencies = [
+                    float(sample[1])
+                    for sample in samples
+                ]
+                sensor_times = [
+                    float(sample[0])
+                    for sample in samples
+                ]
 
-                frequency = sum(frequencies) / len(frequencies)
-                sensor_time = sum(sensor_times) / len(sensor_times)
-                z = frequency_to_z(frequency)
+                frequency = (
+                    sum(frequencies)
+                    / len(frequencies)
+                )
+                sensor_time = (
+                    sum(sensor_times)
+                    / len(sensor_times)
+                )
 
                 with lock:
                     temp = latest_temperature
 
-                    if baseline_frequency is None:
-                        baseline_frequency = frequency
-                    if baseline_temperature is None and temp is not None:
-                        baseline_temperature = temp
-                    if baseline_z is None and z is not None:
-                        baseline_z = z
+                z = frequency_to_z(frequency)
 
-                    history.append({
-                        "sensor_time": sensor_time,
-                        "wall_time": time.time(),
-                        "frequency": frequency,
-                        "temperature": temp,
-                        "z": z
-                    })
+                append_history_point(
+                    frequency,
+                    temp,
+                    z,
+                    sensor_time
+                )
 
             def on_error(ws, error):
                 global connected
@@ -255,10 +592,14 @@ def klipper_worker():
                 on_error=on_error,
                 on_close=on_close
             )
+
+            active_klipper_ws = ws
             ws.run_forever()
+            active_klipper_ws = None
 
         except Exception as e:
             connected = False
+            active_klipper_ws = None
             print("Klipper stream exception:", e)
 
         print("Retrying Klipper connection in 2 seconds...")
@@ -281,9 +622,11 @@ def api_status():
             "config": {
                 "moonraker_host": config["moonraker_host"],
                 "moonraker_port": config["moonraker_port"],
+                "probe_type": config.get("probe_type", "btt_eddy"),
                 "eddy_sensor_name": config["eddy_sensor_name"],
                 "temperature_probe_name": config["temperature_probe_name"],
-                "calibration_points": len(cal_by_freq)
+                "calibration_points": len(cal_by_freq),
+                "cartographer_model_loaded": carto_model is not None
             }
         }
 
@@ -344,10 +687,22 @@ def set_config():
     global baseline_temperature
     global baseline_z
     global cal_by_freq
+    global carto_model
+    global active_klipper_ws
+    global cartographer_stream_owned
 
     data = request.get_json(force=True)
 
     new_config = dict(config)
+
+    if "probe_type" in data:
+        probe_type = str(data["probe_type"]).strip().lower()
+        if probe_type not in ("btt_eddy", "cartographer"):
+            return jsonify({
+                "ok": False,
+                "error": "Unsupported probe type."
+            }), 400
+        new_config["probe_type"] = probe_type
 
     if "moonraker_host" in data:
         new_config["moonraker_host"] = str(data["moonraker_host"]).strip() or "127.0.0.1"
@@ -361,10 +716,34 @@ def set_config():
     if "temperature_probe_name" in data:
         new_config["temperature_probe_name"] = str(data["temperature_probe_name"]).strip()
 
+    if "cartographer_model_text" in data:
+        model_text = str(data["cartographer_model_text"])
+
+        if (
+            new_config.get("probe_type", "btt_eddy") == "cartographer"
+            and model_text.strip()
+        ):
+            try:
+                parsed_carto_model = parse_cartographer_model_text(model_text)
+            except ValueError as e:
+                return jsonify({
+                    "ok": False,
+                    "error": str(e)
+                }), 400
+        else:
+            parsed_carto_model = None
+
+        new_config["cartographer_model_text"] = model_text
+    else:
+        parsed_carto_model = carto_model
+
     if "calibration_text" in data:
         text = str(data["calibration_text"])
 
-        if text.strip():
+        if (
+            text.strip()
+            and new_config.get("probe_type", "btt_eddy") == "btt_eddy"
+        ):
             try:
                 parsed = parse_calibration_text(text)
             except ValueError as e:
@@ -372,6 +751,11 @@ def set_config():
                     "ok": False,
                     "error": str(e)
                 }), 400
+        elif text.strip():
+            # Cartographer provides model-derived distance directly
+            # through scanner/dump, so this text is stored only for
+            # compatibility/reference and is not parsed.
+            parsed = []
         else:
             parsed = []
 
@@ -383,6 +767,7 @@ def set_config():
         config.update(new_config)
 
         cal_by_freq = parsed
+        carto_model = parsed_carto_model
 
         # Old points may have been calculated using a different calibration.
         # Clear history and baseline when configuration changes.
@@ -393,9 +778,20 @@ def set_config():
 
         save_config()
 
+    # Force the stream worker to reconnect using the new settings.
+    if cartographer_stream_owned:
+        stop_cartographer_stream()
+
+    try:
+        if active_klipper_ws is not None:
+            active_klipper_ws.close()
+    except Exception:
+        pass
+
     return jsonify({
         "ok": True,
         "calibration_points": len(cal_by_freq),
+        "cartographer_model_loaded": carto_model is not None,
         "message": "Settings saved. The Klipper stream will reconnect automatically."
     })
 
@@ -437,7 +833,7 @@ HTML = r"""
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Eddy Live Dashboard</title>
+<title>Eddy / Cartographer Live Dashboard</title>
 
 <style>
 :root { color-scheme: dark; }
@@ -721,10 +1117,10 @@ canvas {
 <body>
 <div class="container">
 
-<h1>Eddy Live Dashboard</h1>
+<h1>Eddy / Cartographer Live Dashboard</h1>
 
 <div class="subtitle">
-Live LDC1612 frequency, probe temperature and calibration-equivalent Z
+Live eddy-current probe frequency, temperature and Z/distance
 </div>
 
 <div class="controls">
@@ -758,6 +1154,14 @@ Window:
 <div class="settings-grid">
 
 <div class="field">
+<label for="probeType">Probe type</label>
+<select id="probeType">
+    <option value="btt_eddy">BTT Eddy / Klipper LDC1612</option>
+    <option value="cartographer">Cartographer V3 / Scanner plugin</option>
+</select>
+</div>
+
+<div class="field">
 <label for="moonrakerHost">Moonraker host</label>
 <input id="moonrakerHost" type="text" placeholder="127.0.0.1">
 </div>
@@ -769,23 +1173,23 @@ Window:
 
 <div class="field">
 <label for="eddySensorName">
-Eddy sensor name
+Eddy sensor name (BTT Eddy only)
 </label>
 <input id="eddySensorName" type="text" placeholder="btt_eddy">
 </div>
 
 <div class="field">
 <label for="temperatureProbeName">
-Temperature probe name
+Temperature probe name (BTT Eddy only)
 </label>
 <input id="temperatureProbeName" type="text" placeholder="btt_eddy">
 </div>
 
 </div>
 
-<div class="calibration-field">
+<div class="calibration-field" id="bttCalibrationField">
 <label for="calibrationText">
-Paste calibration data
+BTT Eddy calibration data
 </label>
 
 <textarea id="calibrationText"
@@ -796,15 +1200,33 @@ calibrate =
 #*#    0.130000:678111.331,0.170000:677946.422,"></textarea>
 </div>
 
+<div class="calibration-field" id="cartographerModelField" hidden>
+<label for="cartographerModelText">
+Cartographer scan model
+</label>
+
+<textarea id="cartographerModelText"
+placeholder="Paste the full [cartographer scan_model default] SAVE_CONFIG block here. Example:
+
+#*# [cartographer scan_model default]
+#*# coefficients = 1.414...,1.885...,0.860...
+#*# domain = 3.190766648414659e-07,3.338151076700032e-07
+#*# z_offset = 0
+#*# reference_temperature = 28.82"></textarea>
+</div>
+
 <div class="settings-actions">
 <button id="saveSettings">Save settings</button>
 <span id="settingsMessage" class="message"></span>
 </div>
 
 <div class="note">
-The parser extracts every numeric Z:frequency pair, so Klipper
-<code>#*#</code> prefixes, line breaks and copied formatting are ignored.
-Leave the temperature probe name blank if no temperature probe is available.
+BTT Eddy uses the pasted <code>calibrate =</code> table.
+Cartographer3D Plugin v1.x is read from the Klipper <code>cartographer</code>
+status object. Paste the <code>[cartographer scan_model default]</code>
+block so the dashboard can convert live frequency into model distance.
+The dashboard uses the model coefficients/domain directly; optional
+Cartographer coil temperature-compensation calibration is not reproduced.
 </div>
 
 </div>
@@ -826,7 +1248,7 @@ Leave the temperature probe name blank if no temperature probe is available.
 </div>
 
 <div class="metric">
-    <div class="metric-label">Calibration-equivalent Z</div>
+    <div class="metric-label" id="zMetricLabel">Z / probe distance</div>
     <div class="metric-value" id="z">--</div>
     <div class="metric-small" id="zDelta">Δ --</div>
 </div>
@@ -852,7 +1274,7 @@ Leave the temperature probe name blank if no temperature probe is available.
 </div>
 
 <div class="chart-panel">
-<div class="chart-title">Calibration-equivalent Z (mm)</div>
+<div class="chart-title" id="zChartTitle">Z / probe distance (mm)</div>
 <canvas id="zChart"></canvas>
 </div>
 
@@ -861,9 +1283,9 @@ Leave the temperature probe name blank if no temperature probe is available.
 </div>
 
 <div class="note">
-The Z value is calculated from the calibration pasted into Settings.
-If the current frequency is outside that calibration range, the dashboard
-shows "Out of calibration" instead of extrapolating a Z value.
+BTT Eddy: Z is interpolated from the calibration pasted into Settings.
+Cartographer: Z uses the active Cartographer model's streamed <code>dist</code>
+value directly.
 </div>
 
 </div>
@@ -1234,6 +1656,46 @@ function redraw() {
 }
 
 
+function updateProbeTypeUI() {
+
+    const type =
+        document.getElementById("probeType").value;
+
+    const isCartographer =
+        type === "cartographer";
+
+    document.getElementById(
+        "eddySensorName"
+    ).disabled = isCartographer;
+
+    document.getElementById(
+        "temperatureProbeName"
+    ).disabled = isCartographer;
+
+    document.getElementById(
+        "bttCalibrationField"
+    ).hidden = isCartographer;
+
+    document.getElementById(
+        "cartographerModelField"
+    ).hidden = !isCartographer;
+
+    document.getElementById(
+        "zMetricLabel"
+    ).textContent =
+        isCartographer
+        ? "Cartographer distance"
+        : "Calibration-equivalent Z";
+
+    document.getElementById(
+        "zChartTitle"
+    ).textContent =
+        isCartographer
+        ? "Cartographer model distance (mm)"
+        : "Calibration-equivalent Z (mm)";
+}
+
+
 async function loadConfigForm() {
 
     const response =
@@ -1241,6 +1703,12 @@ async function loadConfigForm() {
 
     const cfg =
         await response.json();
+
+    document.getElementById(
+        "probeType"
+    ).value = cfg.probe_type || "btt_eddy";
+
+    updateProbeTypeUI();
 
     document.getElementById(
         "moonrakerHost"
@@ -1264,9 +1732,21 @@ async function loadConfigForm() {
     ).value =
         cfg.calibration_text || "";
 
-    settingsMessage.textContent =
-        cfg.calibration_points
-        + " calibration points loaded";
+    document.getElementById(
+        "cartographerModelText"
+    ).value =
+        cfg.cartographer_model_text || "";
+
+    if (cfg.probe_type === "cartographer") {
+        settingsMessage.textContent =
+            cfg.cartographer_model_loaded
+            ? "Cartographer scan model loaded"
+            : "Paste the Cartographer scan model below";
+    } else {
+        settingsMessage.textContent =
+            cfg.calibration_points
+            + " calibration points loaded";
+    }
 }
 
 
@@ -1421,6 +1901,14 @@ document.addEventListener(
 
 
 document.getElementById(
+    "probeType"
+).addEventListener(
+    "change",
+    updateProbeTypeUI
+);
+
+
+document.getElementById(
     "saveSettings"
 ).addEventListener(
     "click",
@@ -1433,6 +1921,11 @@ document.getElementById(
             "message";
 
         const payload = {
+            probe_type:
+                document.getElementById(
+                    "probeType"
+                ).value,
+
             moonraker_host:
                 document.getElementById(
                     "moonrakerHost"
@@ -1458,6 +1951,11 @@ document.getElementById(
             calibration_text:
                 document.getElementById(
                     "calibrationText"
+                ).value,
+
+            cartographer_model_text:
+                document.getElementById(
+                    "cartographerModelText"
                 ).value
         };
 
@@ -1489,9 +1987,17 @@ document.getElementById(
             return;
         }
 
-        settingsMessage.textContent =
-            result.calibration_points
-            + " calibration points saved";
+        if (
+            document.getElementById("probeType").value
+            === "cartographer"
+        ) {
+            settingsMessage.textContent =
+                "Cartographer settings saved";
+        } else {
+            settingsMessage.textContent =
+                result.calibration_points
+                + " calibration points saved";
+        }
 
         settingsMessage.className =
             "message ok";
@@ -1525,6 +2031,12 @@ if __name__ == "__main__":
     except Exception as e:
         print("Saved calibration is invalid:", e)
         cal_by_freq = []
+
+    try:
+        rebuild_cartographer_model()
+    except Exception as e:
+        print("Saved Cartographer model is invalid:", e)
+        carto_model = None
 
     threading.Thread(
         target=temperature_worker,
