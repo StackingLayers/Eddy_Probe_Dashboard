@@ -347,7 +347,7 @@ Using Cartographer object: cartographer
 Eddy dashboard starting
   Port:       8085
   Local:      http://127.0.0.1:8085
-  Network:    http://<printer-ip>:8085
+  Network:    http://<printer-ip>:8085  <-- only shows if python3 eddy_dashboard.py --host 0.0.0.0 was used.
 ```
 
 Normal Flask request logs are intentionally suppressed so the terminal stays readable. Meaningful connection, stream, and persistent error messages are still shown.
