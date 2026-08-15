@@ -301,13 +301,14 @@ source venv/bin/activate
 Install dependencies:
 
 ```bash
-pip install Flask websocket-client
+pip install -r requirements.txt
 ```
 
-Copy the dashboard script into the directory and name it:
+Copy the dashboard script and requirements file into the directory:
 
 ```text
 eddy_dashboard.py
+requirements.txt
 ```
 
 The directory should look similar to:
@@ -315,6 +316,7 @@ The directory should look similar to:
 ```text
 ~/eddy-dashboard/
 ├── eddy_dashboard.py
+├── requirements.txt
 └── venv/
 ```
 
@@ -350,8 +352,20 @@ Eddy dashboard starting
 
 Normal Flask request logs are intentionally suppressed so the terminal stays readable. Meaningful connection, stream, and persistent error messages are still shown.
 
-
 Open:
+
+```text
+http://127.0.0.1:8085
+```
+
+By default the dashboard binds to `127.0.0.1:8085` and is reachable only from
+the machine it runs on. To allow access from other devices on your network:
+
+```bash
+python3 eddy_dashboard.py --host 0.0.0.0
+```
+
+Then open:
 
 ```text
 http://PRINTER_IP:8085
@@ -368,6 +382,26 @@ If the printer hostname resolves locally, something like this may also work:
 ```text
 http://voron:8085
 ```
+
+## Security notes
+
+This is a **diagnostic tool**, not a service. Run it manually when you need it
+and stop it when you're done.
+
+**The dashboard is unauthenticated by design.** There is no login. Access
+control relies entirely on the fact that only local/private network clients are
+accepted. Anyone who can reach the port can read live probe data, change the
+configured Moonraker target, and start or stop CSV recordings.
+
+**Do not place this dashboard behind a reverse proxy.** The local-only check
+inspects the real TCP peer address and deliberately ignores `X-Forwarded-For`.
+If nginx, Caddy, Traefik, or similar sits in front of it, every request appears
+to originate from `127.0.0.1`, the local-only check passes for *all* clients
+including those from the Internet, and the protection is silently defeated.
+This matters in practice because Klipper hosts frequently already run nginx for
+Mainsail or Fluidd -- do not add a proxy entry for this dashboard.
+
+Only use `--host 0.0.0.0` on a network you trust.
 
 ---
 
