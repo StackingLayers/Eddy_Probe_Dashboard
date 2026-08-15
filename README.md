@@ -359,7 +359,7 @@ http://127.0.0.1:8085
 ```
 
 By default the dashboard binds to `127.0.0.1:8085` and is reachable only from
-the machine it runs on. To allow access from other devices on your network:
+the machine it runs on. This cannot be changed persistently — --host applies only to the current run. To allow access from other devices on your network:
 
 ```bash
 python3 eddy_dashboard.py --host 0.0.0.0

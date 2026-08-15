@@ -23,6 +23,8 @@ from flask import Flask, Response, jsonify, request, send_from_directory
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(APP_DIR, "eddy_dashboard_config.json")
 RECORDINGS_DIR = os.path.join(APP_DIR, "recordings")
+
+# mode= is ignored when the directory already exists, so chmod unconditionally.
 os.makedirs(RECORDINGS_DIR, mode=0o700, exist_ok=True)
 try:
     os.chmod(RECORDINGS_DIR, 0o700)
@@ -41,10 +43,21 @@ DEFAULT_CONFIG = {
     "frequency_color": "#4f8cff",
     "temperature_color": "#ff6262",
     "z_color": "#58d17b",
-    "web_host": "127.0.0.1",
-    "web_port": 8085,
     "calibration_text": ""
 }
+
+# Bind settings are deliberately NOT part of the persisted configuration.
+#
+# The dashboard is unauthenticated, so exposing it beyond loopback must be an
+# explicit, per-launch decision made with --host.  Keeping these out of the
+# config file means a stale or forgotten "0.0.0.0" can never silently re-expose
+# the dashboard on the LAN, and --host is a one-shot override rather than a
+# setting that quietly becomes permanent.
+DEFAULT_WEB_HOST = "127.0.0.1"
+DEFAULT_WEB_PORT = 8085
+
+# Keys written by older versions that must be discarded on load.
+LEGACY_CONFIG_KEYS = ("web_host", "web_port")
 
 MAX_HISTORY = 50000
 
@@ -393,14 +406,45 @@ test_stopped_at = None
 
 
 def load_config():
+    """
+    Load the saved configuration, discarding obsolete bind settings.
+
+    Older versions stored web_host/web_port in the config file.  Those are
+    stripped here so that a stale "0.0.0.0" left over from a previous run
+    cannot silently re-expose the unauthenticated dashboard on the LAN.
+    """
     global config
-    if os.path.exists(CONFIG_FILE):
+
+    if not os.path.exists(CONFIG_FILE):
+        return
+
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+    except Exception as e:
+        print("Could not load config:", e)
+        return
+
+    if not isinstance(saved, dict):
+        print("Config file is not a JSON object. Using defaults.")
+        return
+
+    stale = [key for key in LEGACY_CONFIG_KEYS if key in saved]
+    for key in stale:
+        saved.pop(key, None)
+
+    config.update(saved)
+
+    if stale:
+        print(
+            "Note: removed obsolete bind settings from the config file "
+            f"({', '.join(stale)}). Use --host / --port instead."
+        )
+        # Rewrite immediately so this message appears only once.
         try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                saved = json.load(f)
-            config.update(saved)
+            save_config()
         except Exception as e:
-            print("Could not load config:", e)
+            print("Could not rewrite config:", e)
 
 
 def save_config():
@@ -3639,29 +3683,23 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--host",
-        default=None,
+        default=DEFAULT_WEB_HOST,
         help=(
-            "Bind address. Defaults to 127.0.0.1 (localhost only). "
-            "Use 0.0.0.0 to allow access from other devices on your LAN."
+            f"Bind address (default: {DEFAULT_WEB_HOST}, this machine only). "
+            "Use 0.0.0.0 to allow access from other devices on your LAN. "
+            "This is never saved between runs."
         )
     )
     parser.add_argument(
         "--port",
         type=int,
-        default=None,
-        help="Bind port. Defaults to 8085."
+        default=DEFAULT_WEB_PORT,
+        help=f"Bind port (default: {DEFAULT_WEB_PORT})."
     )
     args = parser.parse_args()
 
     load_config()
     secure_runtime_permissions()
-
-    # Command-line flags win over anything stored in the config file.
-    if args.host is not None:
-        config["web_host"] = args.host
-
-    if args.port is not None:
-        config["web_port"] = args.port
 
     try:
         validate_moonraker_target(
@@ -3705,24 +3743,17 @@ if __name__ == "__main__":
 
     print()
 
-    # Validate the bind port. A corrupt config value must not crash startup.
-    try:
-        web_port = int(config["web_port"])
-        if not 1 <= web_port <= 65535:
-            raise ValueError
-    except (KeyError, TypeError, ValueError):
-        print("Invalid web_port in configuration. Falling back to 8085.")
-        web_port = 8085
+    # Bind settings come only from the command line, never from the config
+    # file, so they cannot become sticky between runs.
+    web_port = args.port
+    if not 1 <= web_port <= 65535:
+        print(f"Invalid --port {web_port}. Falling back to {DEFAULT_WEB_PORT}.")
+        web_port = DEFAULT_WEB_PORT
 
-    # Validate the bind host. Anything unparseable falls back to loopback.
-    web_host = str(config.get("web_host", "127.0.0.1")).strip()
-
+    web_host = str(args.host).strip()
     if web_host not in ("0.0.0.0", "::") and _parse_ip(web_host) is None:
-        print(
-            f"Invalid web_host {web_host!r} in configuration. "
-            "Falling back to 127.0.0.1."
-        )
-        web_host = "127.0.0.1"
+        print(f"Invalid --host {web_host!r}. Falling back to {DEFAULT_WEB_HOST}.")
+        web_host = DEFAULT_WEB_HOST
 
     bind_ip = _parse_ip(web_host)
     loopback_only = bind_ip is not None and bind_ip.is_loopback
