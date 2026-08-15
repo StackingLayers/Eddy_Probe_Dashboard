@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
+# LAN-only security-hardened Eddy Probe Dashboard
 import atexit
 import csv
 import json
 import logging
+import ipaddress
 import socket
 import math
 import os
@@ -42,6 +44,294 @@ DEFAULT_CONFIG = {
 MAX_HISTORY = 50000
 
 app = Flask(__name__)
+
+# ---------------------------------------------------------------------------
+# LAN-only security hardening
+# ---------------------------------------------------------------------------
+#
+# This dashboard is intentionally unauthenticated and intended only for
+# troubleshooting on a trusted local network.  The controls below reduce the
+# risk of accidental Internet exposure, cross-site browser attacks, DNS
+# rebinding, and Moonraker SSRF without adding a login prompt.
+
+MAX_REQUEST_BYTES = 256 * 1024
+app.config["MAX_CONTENT_LENGTH"] = MAX_REQUEST_BYTES
+
+_LOCAL_IPV4_NETWORKS = (
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("169.254.0.0/16"),
+)
+
+_LOCAL_IPV6_NETWORKS = (
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("fc00::/7"),
+    ipaddress.ip_network("fe80::/10"),
+)
+
+
+def _normalize_ip(ip):
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        return ip.ipv4_mapped
+    return ip
+
+
+def _ip_is_local(ip):
+    ip = _normalize_ip(ip)
+
+    if isinstance(ip, ipaddress.IPv4Address):
+        return any(ip in network for network in _LOCAL_IPV4_NETWORKS)
+
+    return any(ip in network for network in _LOCAL_IPV6_NETWORKS)
+
+
+def _parse_ip(value):
+    try:
+        return _normalize_ip(ipaddress.ip_address(str(value).strip()))
+    except ValueError:
+        return None
+
+
+def _client_is_local():
+    """
+    Check the real TCP peer supplied by Werkzeug.
+
+    X-Forwarded-For is deliberately ignored because the dashboard is intended
+    to be contacted directly on the LAN, not exposed through an Internet-facing
+    reverse proxy.
+    """
+    ip = _parse_ip(request.remote_addr or "")
+    return ip is not None and _ip_is_local(ip)
+
+
+def _request_hostname():
+    """
+    Extract the Host header hostname safely, including IPv6 literals.
+    """
+    try:
+        return urllib.parse.urlsplit("//" + request.host).hostname
+    except Exception:
+        return None
+
+
+def _resolve_host_addresses(host):
+    host = str(host or "").strip()
+    if not host:
+        raise ValueError("Host may not be empty.")
+
+    bracketless = (
+        host[1:-1]
+        if host.startswith("[") and host.endswith("]")
+        else host
+    )
+
+    direct = _parse_ip(bracketless)
+    if direct is not None:
+        return {direct}
+
+    try:
+        infos = socket.getaddrinfo(
+            bracketless,
+            None,
+            type=socket.SOCK_STREAM
+        )
+    except socket.gaierror as exc:
+        raise ValueError(f"Host could not be resolved: {host}") from exc
+
+    addresses = set()
+
+    for info in infos:
+        ip = _parse_ip(info[4][0])
+        if ip is not None:
+            addresses.add(ip)
+
+    if not addresses:
+        raise ValueError(f"Host resolved to no usable IP addresses: {host}")
+
+    return addresses
+
+
+def _host_resolves_only_local(host):
+    try:
+        addresses = _resolve_host_addresses(host)
+    except ValueError:
+        return False
+
+    return bool(addresses) and all(_ip_is_local(ip) for ip in addresses)
+
+
+def _request_host_is_allowed():
+    """
+    Reject arbitrary public Host names to reduce DNS-rebinding risk.
+
+    Direct private/loopback IP access is allowed.  The machine's own hostname,
+    hostname.local, localhost, and names under .local / .home.arpa are also
+    allowed when they resolve only to local addresses.
+    """
+    host = (_request_hostname() or "").rstrip(".").lower()
+    if not host:
+        return False
+
+    direct = _parse_ip(host)
+    if direct is not None:
+        return _ip_is_local(direct)
+
+    machine = socket.gethostname().rstrip(".").lower()
+    allowed_names = {
+        "localhost",
+        machine,
+        f"{machine}.local",
+        f"{machine}.home.arpa",
+    }
+
+    if host in allowed_names:
+        return True
+
+    if host.endswith(".local") or host.endswith(".home.arpa"):
+        return _host_resolves_only_local(host)
+
+    return False
+
+
+def _same_origin_request():
+    """
+    Block browser requests that claim a different Origin/Referer.
+
+    Normal local command-line tools may omit both headers.
+    """
+    expected_host = request.host.lower()
+
+    origin = request.headers.get("Origin", "").strip()
+    if origin:
+        try:
+            parsed = urllib.parse.urlsplit(origin)
+            return parsed.netloc.lower() == expected_host
+        except Exception:
+            return False
+
+    referer = request.headers.get("Referer", "").strip()
+    if referer:
+        try:
+            parsed = urllib.parse.urlsplit(referer)
+            return parsed.netloc.lower() == expected_host
+        except Exception:
+            return False
+
+    return True
+
+
+@app.before_request
+def security_before_request():
+    # Only local/private TCP peers may use the dashboard.
+    if not _client_is_local():
+        return jsonify({
+            "ok": False,
+            "error": "Eddy Dashboard is restricted to local-network clients."
+        }), 403
+
+    # Reduce DNS-rebinding exposure by refusing arbitrary public Host names.
+    if not _request_host_is_allowed():
+        return jsonify({
+            "ok": False,
+            "error": "Unrecognized Host header. Use the printer's local IP or local hostname."
+        }), 403
+
+    if request.method in ("POST", "PUT", "PATCH", "DELETE"):
+        if not _same_origin_request():
+            return jsonify({
+                "ok": False,
+                "error": "Cross-origin state-changing request blocked."
+            }), 403
+
+        # Requiring application/json prevents simple cross-site form/text POSTs.
+        # The dashboard intentionally does not enable CORS.
+        if not request.is_json:
+            return jsonify({
+                "ok": False,
+                "error": "State-changing requests must use application/json."
+            }), 415
+
+    return None
+
+
+@app.after_request
+def security_headers(response):
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Cross-Origin-Resource-Policy"] = "same-origin"
+    response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
+    response.headers["Permissions-Policy"] = (
+        "camera=(), microphone=(), geolocation=(), payment=(), usb=()"
+    )
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline'; "
+        "style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data:; "
+        "connect-src 'self'; "
+        "object-src 'none'; "
+        "frame-ancestors 'none'; "
+        "base-uri 'none'; "
+        "form-action 'self'"
+    )
+
+    if request.path.startswith("/api/") or request.path == "/events":
+        response.headers["Cache-Control"] = "no-store"
+
+    return response
+
+
+def validate_moonraker_target(host, port):
+    """
+    Moonraker may only be reached on a loopback/private/link-local address.
+    """
+    host = str(host or "").strip()
+
+    if not host:
+        raise ValueError("Moonraker host may not be empty.")
+
+    # moonraker_host is a host name/IP, never a URL or path.
+    if any(ch in host for ch in ("/", "\\", "@", "#", "?")):
+        raise ValueError(
+            "Moonraker host must contain only a hostname or IP address."
+        )
+
+    try:
+        port = int(port)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Moonraker port must be an integer.") from exc
+
+    if not 1 <= port <= 65535:
+        raise ValueError("Moonraker port must be between 1 and 65535.")
+
+    addresses = _resolve_host_addresses(host)
+
+    for ip in addresses:
+        if not _ip_is_local(ip):
+            raise ValueError(
+                f"Moonraker address {ip} is not a permitted local/private address."
+            )
+
+
+def secure_runtime_permissions():
+    """
+    Best-effort POSIX permissions.  The dashboard also runs on platforms where
+    chmod semantics may differ, so permission failures are non-fatal.
+    """
+    try:
+        os.chmod(RECORDINGS_DIR, 0o700)
+    except OSError:
+        pass
+
+    if os.path.exists(CONFIG_FILE):
+        try:
+            os.chmod(CONFIG_FILE, 0o600)
+        except OSError:
+            pass
+
 
 # The browser polls several lightweight status endpoints. Werkzeug logs every
 # successful request by default, which makes the terminal extremely noisy.
@@ -89,8 +379,28 @@ def load_config():
 
 
 def save_config():
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+    """Write the configuration atomically with owner-only permissions."""
+    temp_path = CONFIG_FILE + ".tmp"
+
+    with open(temp_path, "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2)
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except OSError:
+            pass
+
+    try:
+        os.chmod(temp_path, 0o600)
+    except OSError:
+        pass
+
+    os.replace(temp_path, CONFIG_FILE)
+
+    try:
+        os.chmod(CONFIG_FILE, 0o600)
+    except OSError:
+        pass
 
 
 def parse_calibration_text(text):
@@ -584,12 +894,14 @@ def safe_recording_name(value):
 def moonraker_http_url(path):
     host = config["moonraker_host"]
     port = config["moonraker_port"]
+    validate_moonraker_target(host, port)
     return f"http://{host}:{port}{path}"
 
 
 def klipper_ws_url():
     host = config["moonraker_host"]
     port = config["moonraker_port"]
+    validate_moonraker_target(host, port)
     return f"ws://{host}:{port}/klippysocket"
 
 
@@ -1152,7 +1464,12 @@ def set_config():
     global active_klipper_ws
     global cartographer_stream_owned
 
-    data = request.get_json(force=True)
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({
+            "ok": False,
+            "error": "Expected a JSON object."
+        }), 400
 
     new_config = dict(config)
 
@@ -1169,7 +1486,24 @@ def set_config():
         new_config["moonraker_host"] = str(data["moonraker_host"]).strip() or "127.0.0.1"
 
     if "moonraker_port" in data:
-        new_config["moonraker_port"] = int(data["moonraker_port"])
+        try:
+            new_config["moonraker_port"] = int(data["moonraker_port"])
+        except (TypeError, ValueError):
+            return jsonify({
+                "ok": False,
+                "error": "Moonraker port must be an integer."
+            }), 400
+
+    try:
+        validate_moonraker_target(
+            new_config.get("moonraker_host", "127.0.0.1"),
+            new_config.get("moonraker_port", 7125)
+        )
+    except ValueError as e:
+        return jsonify({
+            "ok": False,
+            "error": str(e)
+        }), 400
 
     if "auto_detect" in data:
         new_config["auto_detect"] = bool(data["auto_detect"])
@@ -1397,6 +1731,12 @@ def recording_start():
             newline="",
             encoding="utf-8"
         )
+
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+
         recording_writer = csv.writer(
             recording_file
         )
@@ -1519,6 +1859,9 @@ def recordings_list():
 def recording_download(filename):
     filename = os.path.basename(filename)
 
+    if not filename.lower().endswith(".csv"):
+        return jsonify({"error": "Recording not found."}), 404
+
     return send_from_directory(
         RECORDINGS_DIR,
         filename,
@@ -1529,6 +1872,10 @@ def recording_download(filename):
 @app.route("/api/recordings/data/<path:filename>")
 def recording_data(filename):
     filename = os.path.basename(filename)
+
+    if not filename.lower().endswith(".csv"):
+        return jsonify({"error": "Recording not found."}), 404
+
     path = os.path.join(
         RECORDINGS_DIR,
         filename
@@ -2981,7 +3328,7 @@ document.getElementById("detectButton").addEventListener("click",async()=>{
     settingsMessage.className="message";
     settingsMessage.textContent="Detecting...";
 
-    const r=await fetch("/api/detect",{method:"POST"});
+    const r=await fetch("/api/detect",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"});
     const result=await r.json();
 
     if(!r.ok){
@@ -3037,21 +3384,21 @@ document.getElementById("saveSettings").addEventListener("click",async()=>{
 });
 
 async function resetBaseline(){
-    await fetch("/api/reset_baseline",{method:"POST"});
+    await fetch("/api/reset_baseline",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"});
     await loadInitialData();
 }
 
 document.getElementById("resetBaseline").addEventListener("click",resetBaseline);
 
 async function startTest(){
-    await fetch("/api/test/start",{method:"POST"});
+    await fetch("/api/test/start",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"});
     await refreshTestState();
     await loadInitialData();
     closeMenus();
 }
 
 async function stopTest(){
-    await fetch("/api/test/stop",{method:"POST"});
+    await fetch("/api/test/stop",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"});
     await refreshTestState();
     closeMenus();
 }
@@ -3059,7 +3406,7 @@ async function stopTest(){
 document.getElementById("startTest").addEventListener("click",startTest);
 document.getElementById("stopTest").addEventListener("click",stopTest);
 document.getElementById("resetTest").addEventListener("click",async()=>{
-    await fetch("/api/test/reset",{method:"POST"});
+    await fetch("/api/test/reset",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"});
     await refreshTestState();
     closeMenus();
 });
@@ -3092,7 +3439,7 @@ async function startRecording(){
 }
 
 async function stopRecording(){
-    const r=await fetch("/api/recording/stop",{method:"POST"});
+    const r=await fetch("/api/recording/stop",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"});
     const result=await r.json();
 
     if(!r.ok && r.status!==409){
@@ -3237,6 +3584,18 @@ def get_local_lan_ip():
 
 if __name__ == "__main__":
     load_config()
+    secure_runtime_permissions()
+
+    try:
+        validate_moonraker_target(
+            config.get("moonraker_host", "127.0.0.1"),
+            config.get("moonraker_port", 7125)
+        )
+    except ValueError as e:
+        print("Security warning: invalid Moonraker target:", e)
+        print("Falling back to 127.0.0.1:7125")
+        config["moonraker_host"] = "127.0.0.1"
+        config["moonraker_port"] = 7125
 
     if config.get("auto_detect", True):
         try:
@@ -3274,6 +3633,7 @@ if __name__ == "__main__":
     lan_ip = get_local_lan_ip()
 
     print("Eddy dashboard starting")
+    print("  Security:   LAN-only / no login")
     print(f"  Port:       {web_port}")
     print(f"  Local:      http://127.0.0.1:{web_port}")
 
