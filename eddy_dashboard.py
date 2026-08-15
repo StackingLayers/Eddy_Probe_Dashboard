@@ -22,7 +22,11 @@ from flask import Flask, Response, jsonify, request, send_from_directory
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(APP_DIR, "eddy_dashboard_config.json")
 RECORDINGS_DIR = os.path.join(APP_DIR, "recordings")
-os.makedirs(RECORDINGS_DIR, exist_ok=True)
+os.makedirs(RECORDINGS_DIR, mode=0o700, exist_ok=True)
+try:
+    os.chmod(RECORDINGS_DIR, 0o700)
+except OSError:
+    pass
 
 DEFAULT_CONFIG = {
     "moonraker_host": "127.0.0.1",
@@ -36,7 +40,7 @@ DEFAULT_CONFIG = {
     "frequency_color": "#4f8cff",
     "temperature_color": "#ff6262",
     "z_color": "#58d17b",
-    "web_host": "0.0.0.0",
+    "web_host": "127.0.0.1",
     "web_port": 8085,
     "calibration_text": ""
 }
