@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # LAN-only security-hardened Eddy Probe Dashboard
+import argparse
 import atexit
 import csv
 import json
@@ -224,6 +225,26 @@ def _same_origin_request():
             return False
 
     return True
+
+
+def _requested_seconds(default=300.0, minimum=1.0, maximum=86400.0):
+    """
+    Parse the ?seconds= query parameter safely.
+
+    Bare float() accepts 'inf' and 'nan'.  An infinite window makes the cutoff
+    -inf, which serialises the entire history buffer (and runs O(n) regressions
+    over it) on every request; 'nan' makes every comparison false.  Clamp the
+    value to a sane range instead.
+    """
+    try:
+        seconds = float(request.args.get("seconds", default))
+    except (TypeError, ValueError):
+        return default
+
+    if not math.isfinite(seconds):
+        return default
+
+    return max(minimum, min(seconds, maximum))
 
 
 @app.before_request
@@ -1411,10 +1432,7 @@ def api_status():
 
 @app.route("/api/history")
 def api_history():
-    try:
-        seconds = float(request.args.get("seconds", 300))
-    except ValueError:
-        seconds = 300
+    seconds = _requested_seconds()
 
     cutoff = time.time() - seconds
 
@@ -1664,12 +1682,7 @@ def api_detect():
 
 @app.route("/api/stats")
 def api_stats():
-    try:
-        seconds = float(
-            request.args.get("seconds", 300)
-        )
-    except ValueError:
-        seconds = 300
+    seconds = _requested_seconds()
 
     cutoff = time.time() - seconds
 
@@ -1890,78 +1903,85 @@ def recording_data(filename):
             "error": "Recording not found."
         }), 404
 
-    with open(
-        path,
-        "r",
-        encoding="utf-8",
-        newline=""
-    ) as f:
-        rows = list(csv.DictReader(f))
+    try:
+        with open(
+            path,
+            "r",
+            encoding="utf-8",
+            newline=""
+        ) as f:
+            rows = list(csv.DictReader(f))
 
-    if not rows:
-        return jsonify([])
+        if not rows:
+            return jsonify([])
 
-    # Keep comparison payloads practical for the browser.
-    stride = max(
-        1,
-        math.ceil(len(rows) / 1500)
-    )
-
-    selected = rows[::stride]
-
-    if selected[-1] != rows[-1]:
-        selected.append(rows[-1])
-
-    f0 = float(rows[0]["frequency_hz"])
-    z0 = (
-        float(rows[0]["z_or_distance_mm"])
-        if rows[0].get("z_or_distance_mm")
-        else None
-    )
-    t0 = (
-        float(rows[0]["temperature_c"])
-        if rows[0].get("temperature_c")
-        else None
-    )
-    wall0 = float(rows[0]["wall_time_unix"])
-
-    result = []
-
-    for row in selected:
-        wall = float(row["wall_time_unix"])
-        freq = float(row["frequency_hz"])
-        z = (
-            float(row["z_or_distance_mm"])
-            if row.get("z_or_distance_mm")
-            else None
-        )
-        temp = (
-            float(row["temperature_c"])
-            if row.get("temperature_c")
-            else None
+        # Keep comparison payloads practical for the browser.
+        stride = max(
+            1,
+            math.ceil(len(rows) / 1500)
         )
 
-        result.append({
-            "minutes": (wall - wall0) / 60.0,
-            "frequency_delta_hz": freq - f0,
-            "ppm": (
-                (freq - f0) / f0 * 1_000_000
-                if f0 != 0
-                else None
-            ),
-            "z_delta_um": (
-                (z - z0) * 1000.0
-                if z is not None
-                and z0 is not None
-                else None
-            ),
-            "temperature_delta_c": (
-                temp - t0
-                if temp is not None
-                and t0 is not None
+        selected = rows[::stride]
+
+        if selected[-1] != rows[-1]:
+            selected.append(rows[-1])
+
+        f0 = float(rows[0]["frequency_hz"])
+        z0 = (
+            float(rows[0]["z_or_distance_mm"])
+            if rows[0].get("z_or_distance_mm")
+            else None
+        )
+        t0 = (
+            float(rows[0]["temperature_c"])
+            if rows[0].get("temperature_c")
+            else None
+        )
+        wall0 = float(rows[0]["wall_time_unix"])
+
+        result = []
+
+        for row in selected:
+            wall = float(row["wall_time_unix"])
+            freq = float(row["frequency_hz"])
+            z = (
+                float(row["z_or_distance_mm"])
+                if row.get("z_or_distance_mm")
                 else None
             )
-        })
+            temp = (
+                float(row["temperature_c"])
+                if row.get("temperature_c")
+                else None
+            )
+
+            result.append({
+                "minutes": (wall - wall0) / 60.0,
+                "frequency_delta_hz": freq - f0,
+                "ppm": (
+                    (freq - f0) / f0 * 1_000_000
+                    if f0 != 0
+                    else None
+                ),
+                "z_delta_um": (
+                    (z - z0) * 1000.0
+                    if z is not None
+                    and z0 is not None
+                    else None
+                ),
+                "temperature_delta_c": (
+                    temp - t0
+                    if temp is not None
+                    and t0 is not None
+                    else None
+                )
+            })
+
+    except (KeyError, TypeError, ValueError) as e:
+        # A recording truncated by a hard kill can contain a partial final row.
+        return jsonify({
+            "error": f"Recording could not be parsed: {e}"
+        }), 400
 
     return jsonify(result)
 
@@ -2036,26 +2056,50 @@ def test_reset():
 
 
 
+# The SSE endpoint spawns a long-lived Werkzeug thread per connection that
+# never terminates on its own.  Cap concurrent streams so a reconnect loop or
+# a pile of stale browser tabs cannot pin the CPU.
+MAX_EVENT_STREAMS = 8
+_event_stream_lock = threading.Lock()
+_event_stream_count = 0
+
+
 @app.route("/events")
 def events():
+    global _event_stream_count
+
+    with _event_stream_lock:
+        if _event_stream_count >= MAX_EVENT_STREAMS:
+            return jsonify({
+                "ok": False,
+                "error": "Too many open event streams. Close some dashboard tabs."
+            }), 503
+        _event_stream_count += 1
+
     def event_stream():
+        global _event_stream_count
+
         last_wall_time = 0
 
-        while True:
-            point = None
+        try:
+            while True:
+                point = None
 
-            with lock:
-                if history:
-                    newest = history[-1]
+                with lock:
+                    if history:
+                        newest = history[-1]
 
-                    if newest["wall_time"] > last_wall_time:
-                        point = dict(newest)
-                        last_wall_time = newest["wall_time"]
+                        if newest["wall_time"] > last_wall_time:
+                            point = dict(newest)
+                            last_wall_time = newest["wall_time"]
 
-            if point is not None:
-                yield "data: " + json.dumps(point) + "\n\n"
+                if point is not None:
+                    yield "data: " + json.dumps(point) + "\n\n"
 
-            time.sleep(0.05)
+                time.sleep(0.05)
+        finally:
+            with _event_stream_lock:
+                _event_stream_count -= 1
 
     return Response(
         event_stream(),
@@ -3587,8 +3631,37 @@ def get_local_lan_ip():
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description=(
+            "Eddy / Cartographer live probe dashboard. "
+            "Local diagnostic tool; unauthenticated by design."
+        )
+    )
+    parser.add_argument(
+        "--host",
+        default=None,
+        help=(
+            "Bind address. Defaults to 127.0.0.1 (localhost only). "
+            "Use 0.0.0.0 to allow access from other devices on your LAN."
+        )
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="Bind port. Defaults to 8085."
+    )
+    args = parser.parse_args()
+
     load_config()
     secure_runtime_permissions()
+
+    # Command-line flags win over anything stored in the config file.
+    if args.host is not None:
+        config["web_host"] = args.host
+
+    if args.port is not None:
+        config["web_port"] = args.port
 
     try:
         validate_moonraker_target(
@@ -3632,26 +3705,56 @@ if __name__ == "__main__":
 
     print()
 
-    web_port = int(config["web_port"])
-    web_host = config["web_host"]
-    lan_ip = get_local_lan_ip()
+    # Validate the bind port. A corrupt config value must not crash startup.
+    try:
+        web_port = int(config["web_port"])
+        if not 1 <= web_port <= 65535:
+            raise ValueError
+    except (KeyError, TypeError, ValueError):
+        print("Invalid web_port in configuration. Falling back to 8085.")
+        web_port = 8085
+
+    # Validate the bind host. Anything unparseable falls back to loopback.
+    web_host = str(config.get("web_host", "127.0.0.1")).strip()
+
+    if web_host not in ("0.0.0.0", "::") and _parse_ip(web_host) is None:
+        print(
+            f"Invalid web_host {web_host!r} in configuration. "
+            "Falling back to 127.0.0.1."
+        )
+        web_host = "127.0.0.1"
+
+    bind_ip = _parse_ip(web_host)
+    loopback_only = bind_ip is not None and bind_ip.is_loopback
 
     print("Eddy dashboard starting")
-    print("  Security:   LAN-only / no login")
+    print(f"  Bind host:  {web_host}")
     print(f"  Port:       {web_port}")
-    print(f"  Local:      http://127.0.0.1:{web_port}")
 
-    if lan_ip and lan_ip != "127.0.0.1":
-        print(f"  Network:    http://{lan_ip}:{web_port}")
+    if loopback_only:
+        print("  Security:   loopback only / no login")
+        print(f"  Local:      http://127.0.0.1:{web_port}")
+        print()
+        print("  This machine only. Use --host 0.0.0.0 to allow LAN access.")
+    else:
+        print("  Security:   LAN-reachable / NO LOGIN")
+        print(f"  Local:      http://127.0.0.1:{web_port}")
 
-    if web_host not in ("0.0.0.0", "127.0.0.1", "::"):
-        print(f"  Bind host:  {web_host}")
+        lan_ip = get_local_lan_ip()
+        if lan_ip and lan_ip != "127.0.0.1":
+            print(f"  Network:    http://{lan_ip}:{web_port}")
+
+        print()
+        print(f"  WARNING: Binding to {web_host} exposes this unauthenticated")
+        print("           dashboard to every device on your local network.")
+        print("           Do NOT place it behind a reverse proxy - doing so")
+        print("           defeats the local-only client check entirely.")
 
     print()
 
     app.run(
-        host=config["web_host"],
-        port=int(config["web_port"]),
+        host=web_host,
+        port=web_port,
         threaded=True,
         debug=False
     )
